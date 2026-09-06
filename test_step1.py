@@ -1,13 +1,16 @@
 import random
 import unittest
 
-from agent import Agent, ChangePointAgent, ForgetAgent, predicts_open
+from agent import Agent, ChangePointAgent, ForgetAgent, HAZARD_GRID, HierarchicalChangePointAgent, predicts_open
 from protocol import (
+    BLOCKS_005,
+    _regime_worlds,
     bootstrap_ci,
     cohens_dz,
     paired_rototest,
     permutation_pvalue,
     rototest_004,
+    rototest_005,
     run_null_sequence,
     run_prior_sequence,
     run_rototest,
@@ -257,6 +260,89 @@ class ChangeAwareTests(unittest.TestCase):
         for block in ("A-learn", "A-transfer", "B-switch", "C-mixed"):
             self.assertEqual(r1["stats_cn"][block]["mean"], r2["stats_cn"][block]["mean"])
             self.assertEqual(r1["stats_cn"][block]["ci95"], r2["stats_cn"][block]["ci95"])
+        self.assertEqual(r1["verdict"], r2["verdict"])
+        self.assertEqual(r1["gates"], r2["gates"])
+
+
+class HierarchyTests(unittest.TestCase):
+    def _stream(self, feature, n, seed=7):
+        rng = random.Random(seed)
+        return [UnknownWorld.generate(rng, force_feature=feature) for _ in range(n)]
+
+    def test_reset_uniform(self):
+        h = HierarchicalChangePointAgent()
+        for w in self._stream("color", 3):
+            h.run_world(w)
+        h.reset_salience()
+        self.assertAlmostEqual(h.salience()["color"], h.salience()["shape"])
+        self.assertEqual(len(h.trellises), len(HAZARD_GRID))
+        for runs in h.trellises:
+            self.assertEqual(len(runs), 1)
+        self.assertEqual(len({f: 1.0 for f in h.features}.values()), 2)
+
+    def test_fresh_world_equals_bare(self):
+        for seed in (1, 5, 9):
+            rng = random.Random(seed)
+            w = UnknownWorld.generate(rng)
+            a, h = Agent(), HierarchicalChangePointAgent()
+            self.assertEqual(a.run_world(w)["steps"], h.run_world(w)["steps"])
+            self.assertEqual(a.run_world(w)["curve"], h.run_world(w)["curve"])
+
+    def test_stationary_stream_learns_slow(self):
+        h = HierarchicalChangePointAgent()
+        for w in self._stream("color", 20):
+            h.run_world(w)
+        ws = h.hazard_posterior()
+        slow = sum(w for w, hh in zip(ws, h.hazards) if hh <= 1.0 / 8.0)
+        fast = sum(w for w, hh in zip(ws, h.hazards) if hh >= 1.0 / 2.0)
+        self.assertGreater(slow, fast)
+        self.assertLess(ws[0], 0.3)
+
+    def test_fast_stream_does_not_dominate_slow_in_2_feature_geometry(self):
+        h = HierarchicalChangePointAgent()
+        for w in self._stream("color", 20):
+            h.run_world(w)
+        seed = 10
+        for i in range(20):
+            feat = "color" if i % 2 == 0 else "shape"
+            for w in self._stream(feat, 2, seed=seed):
+                h.run_world(w)
+            seed += 1
+        ws = h.hazard_posterior()
+        slow = sum(w for w, hh in zip(ws, h.hazards) if hh <= 1.0 / 8.0)
+        self.assertGreater(slow, 0.5)
+
+    def test_solves_shape_after_color(self):
+        h = HierarchicalChangePointAgent()
+        for w in self._stream("color", 5):
+            h.run_world(w)
+        r = h.run_world(self._stream("shape", 1, seed=7)[0])
+        self.assertEqual(r["held_out"], 100.0)
+        self.assertEqual(r["rule"][0], "shape")
+
+    def test_deterministic(self):
+        a, b = HierarchicalChangePointAgent(), HierarchicalChangePointAgent()
+        for w in self._stream("color", 4):
+            a.run_world(w)
+        for w in self._stream("color", 4):
+            b.run_world(w)
+        self.assertEqual(a.alpha, b.alpha)
+        self.assertEqual(a.hazard_logliks, b.hazard_logliks)
+
+    def test_regime_worlds_alternate(self):
+        rng = random.Random(4)
+        worlds = _regime_worlds(rng, (2, 3), "color")
+        self.assertEqual(len(worlds), 5)
+        self.assertEqual(worlds[0].hidden_rule[0], "color")
+        self.assertEqual(worlds[2].hidden_rule[0], "shape")
+        self.assertEqual(worlds[4].hidden_rule[0], "shape")
+
+    def test_rototest_005_deterministic(self):
+        r1 = rototest_005(seed=9, n_worlds=3, n_seeds=4)
+        r2 = rototest_005(seed=9, n_worlds=3, n_seeds=4)
+        for b in BLOCKS_005:
+            self.assertEqual(r1["stats_ln"][b]["mean"], r2["stats_ln"][b]["mean"])
+            self.assertEqual(r1["stats_ln"][b]["ci95"], r2["stats_ln"][b]["ci95"])
         self.assertEqual(r1["verdict"], r2["verdict"])
         self.assertEqual(r1["gates"], r2["gates"])
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 import random
 import statistics
 
-from agent import Agent, ForgetAgent, ChangePointAgent
+from agent import Agent, ForgetAgent, ChangePointAgent, HierarchicalChangePointAgent
 from world import UnknownWorld
 
 BLOCKS = ("A-learn", "A-transfer", "B-switch", "C-mixed")
@@ -605,5 +605,345 @@ def print_004_report(result):
     print("-" * 82)
     for gate, ok in result["gates"].items():
         print("  %-22s : %s" % (gate.upper(), ok))
+    print("  verdict: %s" % result["verdict"])
+    print("  %s" % result["why"])
+
+
+# ---------------------------------------------------------------------------
+# Experiment 005: learning the hazard rate (regime streams on identical worlds)
+# ---------------------------------------------------------------------------
+
+ARMS_005 = ("null", "fixed", "forget", "learned")
+PACES = ("home", "slow", "fast")
+REGIME_WIDTHS = {"home": (5, 5, 5, 5), "slow": (16, 16), "fast": (2, 2, 2, 2, 2, 2, 2, 2)}
+PACES_START = {"home": "color", "slow": "shape", "fast": "color"}
+N_MIXED = 10
+
+
+def _regime_worlds(srng, widths, start_feature):
+    """A block of worlds whose hidden feature alternates every `width` worlds.
+
+    Forces are feature-only, so value and object population stay randomized
+    per world. The caller chooses the starting feature so a block can
+    *continue* the previous block's regime (calm entry: no forced switch at
+    the block boundary).
+    """
+    worlds = []
+    feature = start_feature
+    for width in widths:
+        for _ in range(width):
+            worlds.append(UnknownWorld.generate(srng, force_feature=feature))
+        feature = "shape" if feature == "color" else "color"
+    return worlds
+
+
+BLOCKS_005 = ("A-learn", "A-transfer", "B-home", "B-slow", "B-fast", "C-mixed")
+
+
+def _arm_factory_005(arm):
+    if arm == "fixed":
+        return lambda: ChangePointAgent(hazard=1.0 / 5.0)
+    if arm == "forget":
+        return lambda: ForgetAgent(forget=0.7)
+    if arm == "learned":
+        return lambda: HierarchicalChangePointAgent()
+    return Agent
+
+
+def _pace_length(pace):
+    return sum(REGIME_WIDTHS[pace])
+
+
+def _rototest_005_arms(seed, n_worlds, n_seeds):
+    """Return per-arm step lists, per-position B steps, and hazard means."""
+    block_len = {"A-learn": n_worlds, "A-transfer": n_worlds, "C-mixed": N_MIXED}
+    for p in PACES:
+        block_len["B-" + p] = _pace_length(p)
+
+    per_arm = {a: {b: [] for b in BLOCKS_005} for a in ARMS_005}
+    b_pos = {a: {p: {t: [] for t in range(1, block_len["B-" + p] + 1)} for p in PACES} for a in ARMS_005}
+    hazard_eff = {"learned": {p: [] for p in ("post-A", "post-home", "post-slow", "post-fast")}}
+    slow_tail = {a: [] for a in ARMS_005}
+
+    order = ("A-learn", "A-transfer", "B-home", "B-slow", "B-fast", "C-mixed")
+
+    for s in range(n_seeds):
+        srng = random.Random(seed * 10000 + s)
+        segs = {
+            "A-learn": [UnknownWorld.generate(srng, force_feature="color") for _ in range(n_worlds)],
+            "A-transfer": [UnknownWorld.generate(srng, force_feature="color") for _ in range(n_worlds)],
+            "B-home": _regime_worlds(srng, REGIME_WIDTHS["home"], PACES_START["home"]),
+            "B-slow": _regime_worlds(srng, REGIME_WIDTHS["slow"], PACES_START["slow"]),
+            "B-fast": _regime_worlds(srng, REGIME_WIDTHS["fast"], PACES_START["fast"]),
+            "C-mixed": [UnknownWorld.generate(srng) for _ in range(N_MIXED)],
+        }
+
+        for arm in ARMS_005:
+            factory = _arm_factory_005(arm)
+            if arm == "null":
+                agent = factory()
+                runs = {b: run_null_sequence(agent, segs[b]) for b in order}
+            else:
+                agent = factory()
+                prior_blocks = ("A-learn", "A-transfer", "B-home", "B-slow", "B-fast")
+                runs = {}
+                for b in prior_blocks:
+                    runs[b] = run_prior_sequence(agent, segs[b])
+                    if arm == "learned" and b in ("A-transfer", "B-home", "B-slow", "B-fast"):
+                        key = "post-A" if b == "A-transfer" else "post-" + b[2:]
+                        hps = agent.hazard_posterior()
+                        e_h = sum(w * h for w, h in zip(hps, agent.hazards))
+                        hazard_eff["learned"][key].append(e_h)
+                fresh = factory()
+                runs["C-mixed"] = run_prior_sequence(fresh, segs["C-mixed"])
+
+            for b in order:
+                res_list = runs[b]
+                per_arm[arm][b].extend(r["steps"] for r in res_list)
+                if b.startswith("B-"):
+                    pace = b[2:]
+                    for t, r in enumerate(res_list, start=1):
+                        b_pos[arm][pace][t].append(r["steps"])
+                if b == "B-slow":
+                    for t, r in enumerate(res_list, start=1):
+                        if (t - 1) % REGIME_WIDTHS["slow"][0] + 1 >= 9:
+                            slow_tail[arm].append(r["steps"])
+
+    return per_arm, b_pos, hazard_eff, slow_tail
+
+
+def _pair_blocks(a_steps, b_steps):
+    return [x - y for x, y in zip(a_steps, b_steps)]
+
+
+def rototest_005(seed=7, n_worlds=5, n_seeds=16):
+    """Can the prior *earn* its hazard rate instead of being handed one?
+
+    Arms: `null` (identical machinery, prior neutralized each world), `fixed`
+    (Experiment 004's change-aware monitor, hand-set h=1/5), `forget`
+    (Itti-Baldi f=0.7), `learned` (hierarchical change-point: model-averages
+    a hazard grid, no hand-set hazard). All arms run identical regime streams
+    after an identical stationary colour history:
+
+    - Block A: 5 learn + 5 transfer colour worlds (the 004 stationary strand).
+    - B-home:  4 regimes of width 5  (the rate h=1/5 was tuned to this).
+    - B-slow:  2 regimes of width 16 (long calm tails; the fixed cap is the
+               *wrong* prior here).
+    - B-fast:  8 regimes of width 2  (switches every other world; h=1/5
+               under-anticipates change).
+    - C-mixed: fresh agent on unconstrained worlds (non-inferiority control).
+
+    Gates (pre-committed, computed by the harness):
+    - A_transfer_no_regression: learned < null on A-transfer (CI upper < 0).
+    - B_home_no_regression:     learned < fixed on B-home worlds 2..20.
+    - B_slow_tail_improved:     learned < fixed on the calm tails
+                                (regime positions 9..16).
+    - B_fast_adapted:           learned < fixed on B-fast worlds 2..16.
+    - C_mixed_no_harm:          learned < null + margin on mixed worlds.
+    """
+    per_arm, b_pos, hazard_eff, slow_tail = _rototest_005_arms(seed, n_worlds, n_seeds)
+
+    saw = {b: len(per_arm["learned"][b]) // n_seeds for b in BLOCKS_005}
+
+    ln = {b: _pair_blocks(per_arm["learned"][b], per_arm["null"][b]) for b in BLOCKS_005}
+    lf = {b: _pair_blocks(per_arm["learned"][b], per_arm["fixed"][b]) for b in BLOCKS_005}
+
+    stats_ln = {}
+    for i, b in enumerate(BLOCKS_005):
+        per_seed = []
+        wpt = saw[b]
+        for s in range(n_seeds):
+            chunk = ln[b][s * wpt : (s + 1) * wpt]
+            per_seed.append(sum(chunk) / len(chunk))
+        stats_ln[b] = _block_stats(b, i, ln[b], per_seed, seed)
+
+    def pool_lf(pace, positions):
+        diffs = []
+        for t in positions:
+            for j in range(n_seeds):
+                diffs.append(b_pos["learned"][pace][t][j] - b_pos["fixed"][pace][t][j])
+        return diffs
+
+    pos_lf = {
+        p: {t: [x - y for x, y in zip(b_pos["learned"][p][t], b_pos["fixed"][p][t])]
+            for t in b_pos["learned"][p]}
+        for p in PACES
+    }
+
+    home_ds = pool_lf("home", range(2, saw["B-home"] + 1))
+    slow_tail_ds = []
+    for t in range(1, saw["B-slow"] + 1):
+        if (t - 1) % 16 + 1 >= 9:
+            slow_tail_ds.extend(pos_lf["slow"][t])
+    fast_ds = pool_lf("fast", range(2, saw["B-fast"] + 1))
+
+    a_ci = bootstrap_ci(ln["A-transfer"], _resample_seed(seed, 201))
+    home_ci = bootstrap_ci(home_ds, _resample_seed(seed, 202))
+    slow_ci = bootstrap_ci(slow_tail_ds, _resample_seed(seed, 203))
+    fast_ci = bootstrap_ci(fast_ds, _resample_seed(seed, 204))
+    c_ci = bootstrap_ci(ln["C-mixed"], _resample_seed(seed, 205))
+
+    a_improve = a_ci[1] < 0.0
+    home_ok = home_ci[1] < 0.0
+    slow_ok = slow_ci[1] < 0.0
+    fast_ok = fast_ci[1] < 0.0
+    no_harm = c_ci[1] < C_MARGIN
+
+    gates = {
+        "A_transfer_no_regression": a_improve,
+        "B_home_no_regression": home_ok,
+        "B_slow_tail_improved": slow_ok,
+        "B_fast_adapted": fast_ok,
+        "C_mixed_no_harm": no_harm,
+    }
+
+    if all(gates.values()):
+        verdict = "kept"
+        why = (
+            "A hazard learned from the stream preserves the stationary "
+            "transfer benefit, is not worse than the hand-set h=1/5 exactly "
+            "where 1/5 was tuned, beats it on the slow calm tails (the fixed "
+            "cap) and on the fast regime (switches every other world), and "
+            "stays harmless on mixed worlds. The experimenter no longer "
+            "chooses the rate of forgetting. Keep it."
+        )
+    elif not a_improve:
+        verdict = "rejected"
+        why = (
+            "Learned-hazard salience lost the transfer benefit over the "
+            "identical-machinery control: the hierarchy broke the prior."
+        )
+    else:
+        verdict = "inconclusive"
+        why = (
+            "Signals mixed (A_improve=%s home_ok=%s slow_ok=%s fast_ok=%s "
+            "no_harm=%s). Do not keep the primitive."
+            % (a_improve, home_ok, slow_ok, fast_ok, no_harm)
+        )
+
+    slow_lf_ci = bootstrap_ci(lf["B-slow"], _resample_seed(seed, 206))
+
+    return {
+        "stats_ln": stats_ln,
+        "lf": lf,
+        "pos_lf": pos_lf,
+        "home_ds": home_ds,
+        "home_ci": home_ci,
+        "slow_tail_ds": slow_tail_ds,
+        "slow_ci": slow_ci,
+        "fast_ds": fast_ds,
+        "fast_ci": fast_ci,
+        "slow_tail_steps": slow_tail,
+        "saw": saw,
+        "a_ci": a_ci,
+        "c_ci": c_ci,
+        "slow_lf_ci": slow_lf_ci,
+        "hazard_eff": hazard_eff,
+        "gates": gates,
+        "verdict": verdict,
+        "why": why,
+        "n_seeds": n_seeds,
+        "n_worlds": n_worlds,
+        "seed_base": seed,
+    }
+
+
+def print_005_report(result):
+    rho = REGIME_WIDTHS
+    saw = result["saw"]
+    stats = result["stats_ln"]
+    print("  learned vs null (identical worlds; d = n_exp(learned) - n_exp(null))")
+    print(
+        "  block        n    mean d  95% CI            p(prior<null)  dz     seeds helping"
+    )
+    print("-" * 82)
+    for b in BLOCKS_005:
+        s = stats[b]
+        dz = "  n/a" if s["dz"] is None else "%5.2f" % s["dz"]
+        print(
+            "  %-12s %4d  %6.2f  [%6.2f, %6.2f]   %s     %s   %d/%d"
+            % (
+                b,
+                s["n"],
+                s["mean"],
+                s["ci95"][0],
+                s["ci95"][1],
+                "%.4f" % s["p_less"],
+                dz,
+                s["seeds_help"],
+                result["n_seeds"],
+            )
+        )
+    print("-" * 82)
+    print("  learned vs fixed h=1/5  (d = n_exp(learned) - n_exp(fixed))")
+    print("  block        n    mean d  95% CI")
+    print("  " + "-" * 46)
+    for b in BLOCKS_005:
+        ds = result["lf"][b]
+        lo, hi, m = bootstrap_ci(ds, _resample_seed(result["seed_base"], 300 + BLOCKS_005.index(b)))
+        print("  %-12s %4d  %6.2f  [%6.2f, %6.2f]" % (b, len(ds), m, lo, hi))
+    print("  " + "-" * 46)
+
+    def ef_ci(ds, salt):
+        lo, hi, m = bootstrap_ci(ds, _resample_seed(result["seed_base"], salt))
+        return m, lo, hi
+
+    print("  regime-relative position, learned - fixed (mean d, 95% CI)")
+    for pace in PACES:
+        width = rho[pace][0]
+        print("  -- %-5s (regime width %d) --" % (pace, width))
+        for pos in range(1, width + 1):
+            ds = []
+            for t in range(1, saw["B-" + pace] + 1):
+                if (t - 1) % width + 1 == pos:
+                    ds.extend(result["pos_lf"][pace][t])
+            m, lo, hi = ef_ci(ds, 400 + 3 * {"home": 0, "slow": 1, "fast": 2}[pace] + pos)
+            print(
+                "    pos %2d  mean d %6.2f  95%% CI [%6.2f, %6.2f]"
+                % (pos, m, lo, hi)
+            )
+    print("-" * 82)
+
+    m, lo, hi = ef_ci(result["slow_tail_ds"], 500)
+    print(
+        "  learned vs fixed, B-slow calm tails (positions 9..16): mean d %6.2f  95%% CI [%6.2f, %6.2f]"
+        % (m, lo, hi)
+    )
+    st = result["slow_tail_steps"]
+    print(
+        "  mean n_exp per arm on the B-slow calm tails: learned %.2f  fixed %.2f  forget %.2f  null %.2f"
+        % (
+            sum(st["learned"]) / len(st["learned"]),
+            sum(st["fixed"]) / len(st["fixed"]),
+            sum(st["forget"]) / len(st["forget"]),
+            sum(st["null"]) / len(st["null"]),
+        )
+    )
+    print("-" * 82)
+
+    print("  gate CIs (the verdict is drawn on these boundaries)")
+    rows = [
+        ("A_transfer (learned-null, A-transfer)", "a_ci", "upper<0"),
+        ("B_home     (learned-fixed, worlds 2..end)", "home_ci", "upper<0"),
+        ("B_slow_tail(learned-fixed, calm tails)", "slow_ci", "upper<0"),
+        ("B_fast     (learned-fixed, worlds 2..end)", "fast_ci", "upper<0"),
+        ("C_mixed    (learned-null + margin)", "c_ci", "upper<0.25"),
+    ]
+    for label, key, rule in rows:
+        lo, hi, m = result[key]
+        print(
+            "    %-38s mean d %6.2f  95%% CI [%6.2f, %6.2f]   (%s)"
+            % (label, m, lo, hi, rule)
+        )
+    print("-" * 82)
+
+    print("  effective hazard of the learned prior (posterior mean E[h], averaged over seeds)")
+    for name in ("post-A", "post-home", "post-slow", "post-fast"):
+        vals = result["hazard_eff"]["learned"][name]
+        mean_h = sum(vals) / len(vals) if vals else 0.0
+        print("    after %-8s   E[h] = %.4f" % (name.replace("post-", ""), mean_h))
+    print("-" * 82)
+    for gate, ok in result["gates"].items():
+        print("  %-26s : %s" % (gate.upper(), ok))
     print("  verdict: %s" % result["verdict"])
     print("  %s" % result["why"])

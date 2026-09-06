@@ -266,3 +266,131 @@ class ChangePointAgent(Agent):
         total_p = sum(p for _, p, _ in merged) or 1.0
         self.runs = [(r, p / total_p, counts) for r, p, counts in merged]
         self.alpha = self._expected_counts()
+
+
+# ---------------------------------------------------------------------------
+# Experiment 005: learning the hazard rate (hierarchical change-point)
+# ---------------------------------------------------------------------------
+
+
+HAZARD_GRID = (
+    1.0 / 2.0,
+    1.0 / 3.0,
+    1.0 / 4.0,
+    1.0 / 6.0,
+    1.0 / 8.0,
+    1.0 / 16.0,
+    1.0 / 32.0,
+)
+
+
+class HierarchicalChangePointAgent(Agent):
+    """Prior whose *rate* of forgetting is learned from the stream (Wilson et al. 2010).
+
+    Runs one exact Dirichlet-categorical run-length trellis per candidate on
+    a hazard grid, accumulates each candidate's conditional predictive
+    marginal likelihood (the per-event run-length normalizer; the hazard
+    dependence reaches it through the way each candidate's run-length
+    posterior evolves), and model-averages the salience counts over the
+    hazard posterior. The experimenter sets no hazard.
+
+    At a uniform hazard posterior this behaves exactly like the bare
+    Experiment 002 prior inside a single world, so the identical-machinery
+    null control stays valid.
+    """
+
+    def __init__(self, features=None, hazards=HAZARD_GRID, run_cap=20, max_states=64):
+        super().__init__(features)
+        self.hazards = tuple(hazards)
+        self.run_cap = run_cap
+        self.max_states = max_states
+        self.reset_salience()
+
+    def reset_salience(self):
+        super().reset_salience()
+        self.hazard_logliks = [0.0] * len(self.hazards)
+        self.trellises = [
+            [(0, 1.0, {f: 1.0 for f in self.features})] for _ in self.hazards
+        ]
+
+    def hazard_posterior(self):
+        peak = max(self.hazard_logliks)
+        weights = [math.exp(x - peak) for x in self.hazard_logliks]
+        total = sum(weights) or 1.0
+        return [w / total for w in weights]
+
+    def _expected_counts_trellis(self, runs):
+        total = sum(p for _, p, _ in runs) or 1.0
+        out = {f: 0.0 for f in self.features}
+        for _, p, counts in runs:
+            for f in self.features:
+                out[f] += (p / total) * counts[f]
+        return out
+
+    def _trellis_step(self, runs, winner, hazard):
+        """One run-length update for one candidate. Returns (runs, ll_delta).
+
+        ll_delta is the conditional predictive mass (the normalization
+        constant of the run-length posterior update) for this observation
+        under this candidate hazard.
+        """
+        fs = list(self.features)
+
+        def bump(counts):
+            c = dict(counts)
+            c[winner] += 1.0
+            return c
+
+        fresh = {f: 1.0 for f in fs}
+        fresh[winner] += 1.0
+
+        new = []
+        for r, p, counts in runs:
+            total = sum(counts.values())
+            if total <= 0:
+                continue
+            pred = counts[winner] / float(total)
+            new.append((min(r + 1, self.run_cap), p * (1.0 - hazard) * pred, bump(counts)))
+            new.append((0, p * hazard * pred, dict(fresh)))
+
+        ll_delta = sum(p for _, p, _ in new)
+
+        dedup = {}
+        for r, p, counts in new:
+            key = (r, tuple(sorted(counts.items())))
+            if key not in dedup:
+                dedup[key] = [0.0, counts]
+            dedup[key][0] += p
+        merged = [(r, p, counts) for (r, _), (p, counts) in dedup.items()]
+        merged.sort(key=lambda s: -s[1])
+        if len(merged) > self.max_states:
+            merged = merged[: self.max_states]
+        total_p = sum(p for _, p, _ in merged) or 1.0
+        return [(r, p / total_p, counts) for r, p, counts in merged], ll_delta
+
+    def note_convergence(self):
+        rule = self.surviving_rule()
+        if rule is None:
+            return
+        winner = rule[0]
+        if winner not in self.alpha:
+            return
+
+        new_trellises = []
+        ll_deltas = []
+        for runs, hazard in zip(self.trellises, self.hazards):
+            updated, ll = self._trellis_step(runs, winner, hazard)
+            new_trellises.append(updated)
+            ll_deltas.append(ll)
+        self.trellises = new_trellises
+
+        for j, ll in enumerate(ll_deltas):
+            self.hazard_logliks[j] += math.log(max(ll, 1e-300))
+
+        weights = self.hazard_posterior()
+        out = {f: 0.0 for f in self.features}
+        for w, runs in zip(weights, self.trellises):
+            exp = self._expected_counts_trellis(runs)
+            for f in self.features:
+                out[f] += w * exp[f]
+        self.alpha = out
