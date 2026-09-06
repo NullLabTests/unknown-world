@@ -1,12 +1,13 @@
 import random
 import unittest
 
-from agent import Agent, predicts_open
+from agent import Agent, ChangePointAgent, ForgetAgent, predicts_open
 from protocol import (
     bootstrap_ci,
     cohens_dz,
     paired_rototest,
     permutation_pvalue,
+    rototest_004,
     run_null_sequence,
     run_prior_sequence,
     run_rototest,
@@ -176,6 +177,88 @@ class PairedV2Tests(unittest.TestCase):
         r = paired_rototest(seed=9, n_worlds=2, n_seeds=3)
         for block in ("A-learn", "A-transfer", "B-switch", "C-mixed"):
             self.assertEqual(r["blocks"][block]["n"], r["blocks"][block]["n"])
+
+
+class ChangeAwareTests(unittest.TestCase):
+    def _stream(self, feature, n, seed=7):
+        rng = random.Random(seed)
+        return [UnknownWorld.generate(rng, force_feature=feature) for _ in range(n)]
+
+    def test_forget_f1_equals_bare(self):
+        bare, f1 = Agent(), ForgetAgent(forget=1.0)
+        for w in self._stream("color", 5):
+            self.assertEqual(bare.run_world(w)["steps"], f1.run_world(w)["steps"])
+
+    def test_forget_precision_saturates(self):
+        f = ForgetAgent(forget=0.7)
+        for w in self._stream("color", 20):
+            f.run_world(w)
+        self.assertLessEqual(f.alpha["color"], 1.0 / (1.0 - 0.7) + 1.01)
+
+    def test_forget_reset(self):
+        f = ForgetAgent(forget=0.7)
+        for w in self._stream("color", 3):
+            f.run_world(w)
+        f.reset_salience()
+        self.assertAlmostEqual(f.alpha["color"], f.alpha["shape"])
+
+    def test_changepoint_low_hazard_equals_bare(self):
+        cp = ChangePointAgent(hazard=1e-9)
+        for w in self._stream("color", 5):
+            cp.run_world(w)
+        self.assertAlmostEqual(cp.alpha["color"], 6.0, places=3)
+        self.assertAlmostEqual(cp.alpha["shape"], 1.0, places=3)
+
+    def test_changepoint_reweights_fast_after_switch(self):
+        cp = ChangePointAgent(hazard=1.0 / 5.0)
+        bare = Agent()
+        for w in self._stream("color", 5):
+            cp.run_world(w)
+            bare.run_world(w)
+        after_color = cp.salience()
+        world = self._stream("shape", 1, seed=7)[0]
+        cp.run_world(world)
+        bare.run_world(world)
+        self.assertLess(cp.salience()["color"], after_color["color"])
+        self.assertLess(cp.salience()["color"], bare.salience()["color"])
+        self.assertGreater(cp.salience()["shape"], bare.salience()["shape"])
+
+    def test_changepoint_run_length_collapses_on_switch(self):
+        cp = ChangePointAgent(hazard=1.0 / 5.0)
+        for w in self._stream("color", 5):
+            cp.run_world(w)
+        er_before = sum(r * p for r, p, _ in cp.runs)
+        cp.run_world(self._stream("shape", 1, seed=7)[0])
+        er_after = sum(r * p for r, p, _ in cp.runs)
+        self.assertGreater(er_before, er_after)
+
+    def test_both_mechanisms_solve_shape_after_color(self):
+        for cls in (ForgetAgent, ChangePointAgent):
+            a = cls()
+            for w in self._stream("color", 5):
+                a.run_world(w)
+            r = a.run_world(self._stream("shape", 1, seed=7)[0])
+            self.assertEqual(r["held_out"], 100.0)
+            self.assertEqual(r["rule"][0], "shape")
+
+    def test_changepoint_deterministic(self):
+        a, b = ChangePointAgent(), ChangePointAgent()
+        for w in self._stream("color", 4):
+            a.run_world(w)
+        for w in self._stream("color", 4):
+            b.run_world(w)
+        for f in a.alpha:
+            self.assertEqual(a.alpha[f], b.alpha[f])
+        self.assertEqual(len(a.runs), len(b.runs))
+
+    def test_rototest_004_deterministic(self):
+        r1 = rototest_004(seed=9, n_worlds=3, n_seeds=4)
+        r2 = rototest_004(seed=9, n_worlds=3, n_seeds=4)
+        for block in ("A-learn", "A-transfer", "B-switch", "C-mixed"):
+            self.assertEqual(r1["stats_cn"][block]["mean"], r2["stats_cn"][block]["mean"])
+            self.assertEqual(r1["stats_cn"][block]["ci95"], r2["stats_cn"][block]["ci95"])
+        self.assertEqual(r1["verdict"], r2["verdict"])
+        self.assertEqual(r1["gates"], r2["gates"])
 
 
 if __name__ == "__main__":

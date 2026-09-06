@@ -160,3 +160,109 @@ class Agent:
             "rule": self.surviving_rule(),
             "salience": dict(self.salience()),
         }
+
+
+# ---------------------------------------------------------------------------
+# Experiment 004: salience that can be wrong, and can change its mind.
+# ---------------------------------------------------------------------------
+
+
+class ForgetAgent(Agent):
+    """Salience with bounded precision (Itti & Baldi 2005; forget factor `f`).
+
+    Dirichlet-style counts updated as alpha[f] = f*alpha[f] + (1 if winner
+    else 0), so counts saturate around 1/(1-f) instead of growing without
+    bound. At f=1.0 this reduces exactly to the Experiment 002 bare prior.
+    """
+
+    def __init__(self, features=None, forget=0.7):
+        super().__init__(features)
+        self.forget = forget
+
+    def note_convergence(self):
+        rule = self.surviving_rule()
+        if rule is None:
+            return
+        winner = rule[0]
+        if winner in self.alpha:
+            self.alpha = {
+                f: self.forget * self.alpha[f] + (1.0 if f == winner else 0.0)
+                for f in self.features
+            }
+
+
+class ChangePointAgent(Agent):
+    """Evidence-gated forgetting via a run-length monitor (Adams & MacKay 2007).
+
+    Maintains an exact posterior over run length r (worlds since the last
+    regime change) over the sequence of converging winner features, with a
+    per-world change hazard `h`. States are (r, prob, Dirichlet-count-vector)
+    triples; growth carries a state to r+1, a change emits a fresh state at
+    r=0 whose counts restart from the uniform base (this is the key
+    difference from fixed forgetting: never-winning features are *restored*,
+    not decayed toward zero). Salience counts used for ACT are the
+    posterior-weighted average of per-state counts.
+    """
+
+    def __init__(self, features=None, hazard=1.0 / 5.0, run_cap=20, max_states=64):
+        super().__init__(features)
+        self.hazard = hazard
+        self.run_cap = run_cap
+        self.max_states = max_states
+        self.runs = None
+        self.reset_salience()
+
+    def reset_salience(self):
+        super().reset_salience()
+        self.runs = [(0, 1.0, {f: 1.0 for f in self.features})]
+
+    def _expected_counts(self):
+        total = sum(p for _, p, _ in self.runs) or 1.0
+        out = {f: 0.0 for f in self.features}
+        for _, p, counts in self.runs:
+            for f in self.features:
+                out[f] += (p / total) * counts[f]
+        return out
+
+    def note_convergence(self):
+        rule = self.surviving_rule()
+        if rule is None:
+            return
+        winner = rule[0]
+        if winner not in self.alpha:
+            return
+
+        fs = list(self.features)
+
+        def bump(counts):
+            c = dict(counts)
+            c[winner] += 1.0
+            return c
+
+        fresh = {f: 1.0 for f in fs}
+        fresh[winner] += 1.0
+
+        # Exact unmerged trellis: growth -> r+1 with bumped counts; change ->
+        # r=0 with fresh uniform-based counts. Dedupe only identical states.
+        new = []
+        for r, p, counts in self.runs:
+            total = sum(counts.values())
+            if total <= 0:
+                continue
+            pred = counts[winner] / float(total)
+            new.append((min(r + 1, self.run_cap), p * (1.0 - self.hazard) * pred, bump(counts)))
+            new.append((0, p * self.hazard * pred, dict(fresh)))
+
+        dedup = {}
+        for r, p, counts in new:
+            key = (r, tuple(sorted(counts.items())))
+            if key not in dedup:
+                dedup[key] = [0.0, counts]
+            dedup[key][0] += p
+        merged = [(r, p, counts) for (r, _), (p, counts) in dedup.items()]
+        merged.sort(key=lambda s: -s[1])
+        if len(merged) > self.max_states:
+            merged = merged[: self.max_states]
+        total_p = sum(p for _, p, _ in merged) or 1.0
+        self.runs = [(r, p / total_p, counts) for r, p, counts in merged]
+        self.alpha = self._expected_counts()

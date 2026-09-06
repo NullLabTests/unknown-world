@@ -12,7 +12,7 @@ from __future__ import annotations
 import random
 import statistics
 
-from agent import Agent
+from agent import Agent, ForgetAgent, ChangePointAgent
 from world import UnknownWorld
 
 BLOCKS = ("A-learn", "A-transfer", "B-switch", "C-mixed")
@@ -414,6 +414,194 @@ def print_paired_report(result):
             "    world %d  mean d %6.2f  95%% CI [%6.2f, %6.2f]"
             % (t, c["mean"], c["ci95"][0], c["ci95"][1])
         )
+    print("-" * 82)
+    for gate, ok in result["gates"].items():
+        print("  %-22s : %s" % (gate.upper(), ok))
+    print("  verdict: %s" % result["verdict"])
+    print("  %s" % result["why"])
+
+
+# ---------------------------------------------------------------------------
+# Experiment 004: change-aware salience (four arms on identical worlds)
+# ---------------------------------------------------------------------------
+
+ARMS = ("null", "bare", "forget", "change")
+C_MARGIN = 0.25  # non-inferiority margin for the mixed control
+
+
+def _arm_factory(arm):
+    if arm == "forget":
+        return lambda: ForgetAgent(forget=0.7)
+    if arm == "change":
+        return lambda: ChangePointAgent(hazard=1.0 / 5.0)
+    return Agent
+
+
+def _rototest_004_arms(seed, n_worlds, n_seeds):
+    """Return {arm: {block: [steps per world]}} over identical per-seed worlds."""
+    per_arm = {a: {b: [] for b in BLOCKS} for a in ARMS}
+    b_pos = {a: {t: [] for t in range(1, n_worlds + 1)} for a in ARMS}
+
+    for s in range(n_seeds):
+        srng = random.Random(seed * 10000 + s)
+        segs = [
+            [UnknownWorld.generate(srng, force_feature="color") for _ in range(n_worlds)],
+            [UnknownWorld.generate(srng, force_feature="color") for _ in range(n_worlds)],
+            [UnknownWorld.generate(srng, force_feature="shape") for _ in range(n_worlds)],
+            [UnknownWorld.generate(srng) for _ in range(2 * n_worlds)],
+        ]
+        for arm in ARMS:
+            factory = _arm_factory(arm)
+            if arm == "null":
+                agent = factory()
+                steps_by_seg = [run_null_sequence(agent, seg) for seg in segs]
+            else:
+                agent = factory()
+                steps_by_seg = [run_prior_sequence(agent, seg) for seg in segs[:3]]
+                fresh = factory()
+                steps_by_seg.append(run_prior_sequence(fresh, segs[3]))
+            for blk, steps in zip(BLOCKS, steps_by_seg):
+                per_arm[arm][blk].extend(s["steps"] for s in steps)
+            for t, res in enumerate(steps_by_seg[2], start=1):
+                b_pos[arm][t].append(res["steps"])
+    return per_arm, b_pos
+
+
+def _pair(a, b):
+    return [x - y for x, y in zip(a, b)]
+
+
+def rototest_004(seed=7, n_worlds=5, n_seeds=16):
+    """Change-aware salience vs bare prior vs fixed-forgetting vs null.
+
+    Arms run the exact same world streams. The kept/reject question is
+    whether evidence-gated forgetting (C) reduces the measured B-switch cost
+    relative to the bare prior (B worlds after the first) without giving up
+    the transfer benefit or harming the mixed control.
+    """
+    per_arm, b_pos = _rototest_004_arms(seed, n_worlds, n_seeds)
+
+    def blk(arm, b):
+        return per_arm[arm][b]
+
+    def pos_diffs(arm_a, arm_b, t):
+        return _pair(b_pos[arm_a][t], b_pos[arm_b][t])
+
+    cn = {b: _pair(blk("change", b), blk("null", b)) for b in BLOCKS}
+    ctb = {b: _pair(blk("change", b), blk("bare", b)) for b in BLOCKS}
+    ftb = {b: _pair(blk("forget", b), blk("bare", b)) for b in BLOCKS}
+
+    stats_cn = {}
+    for i, b in enumerate(BLOCKS):
+        per_seed = []
+        for s in range(n_seeds):
+            chunk = cn[b][s * n_worlds : (s + 1) * n_worlds]
+            per_seed.append(sum(chunk) / len(chunk))
+        stats_cn[b] = _block_stats(b, i, cn[b], per_seed, seed)
+
+    b_reduced_ds = []
+    for t in range(2, n_worlds + 1):
+        b_reduced_ds.extend(pos_diffs("change", "bare", t))
+    b_reduced_ci = bootstrap_ci(b_reduced_ds, _resample_seed(seed, 31))
+
+    a_ci = stats_cn["A-transfer"]["ci95"]
+    c_ci = stats_cn["C-mixed"]["ci95"]
+    first_ds = pos_diffs("change", "bare", 1)
+    first_ci = bootstrap_ci(first_ds, _resample_seed(seed, 32))
+
+    a_improve = a_ci[1] < 0.0
+    b_reduced = b_reduced_ci[1] < 0.0
+    no_harm = c_ci[1] < C_MARGIN
+    gates = {"A_transfer_improve": a_improve, "B_switch_reduced": b_reduced, "C_mixed_no_harm": no_harm}
+
+    if all(gates.values()):
+        verdict = "kept"
+        why = (
+            "Change-aware salience preserves the transfer benefit, reliably "
+            "cuts the post-first switch cost below the bare prior, and stays "
+            "harmless on mixed worlds. The prior can change its mind. Keep it."
+        )
+    elif not a_improve:
+        verdict = "rejected"
+        why = (
+            "Change-aware salience lost the transfer benefit over the "
+            "identical-machinery control. The added machinery broke the prior."
+        )
+    else:
+        verdict = "inconclusive"
+        why = (
+            "Signals mixed (A_improve=%s B_reduced=%s C_no_harm=%s). "
+            "Do not keep the primitive."
+            % (a_improve, b_reduced, no_harm)
+        )
+
+    curve = {}
+    for t in range(1, n_worlds + 1):
+        cb = pos_diffs("change", "bare", t)
+        fb = pos_diffs("forget", "bare", t)
+        cb_ci = bootstrap_ci(cb, _resample_seed(seed, 100 + t))
+        fb_ci = bootstrap_ci(fb, _resample_seed(seed, 200 + t))
+        curve[t] = {
+            "change_minus_bare": (cb_ci[0], cb_ci[1], cb_ci[2]),
+            "forget_minus_bare": (fb_ci[0], fb_ci[1], fb_ci[2]),
+        }
+
+    return {
+        "stats_cn": stats_cn,
+        "curve": curve,
+        "b_reduced": b_reduced_ds,
+        "b_reduced_ci": b_reduced_ci,
+        "first": first_ds,
+        "first_ci": first_ci,
+        "gates": gates,
+        "verdict": verdict,
+        "why": why,
+        "n_seeds": n_seeds,
+        "n_worlds": n_worlds,
+        "seed_base": seed,
+    }
+
+
+def print_004_report(result):
+    stats_cn = result["stats_cn"]
+    print(
+        "  change-aware vs null (identical worlds; d = n_exp(change) - n_exp(null))"
+    )
+    print(
+        "  block        n    mean d  95% CI            p(prior<null)  dz     seeds helping"
+    )
+    print("-" * 82)
+    for block in BLOCKS:
+        s = stats_cn[block]
+        dz = "  n/a" if s["dz"] is None else "%5.2f" % s["dz"]
+        print(
+            "  %-12s %4d  %6.2f  [%6.2f, %6.2f]   %s     %s   %d/%d"
+            % (
+                block,
+                s["n"],
+                s["mean"],
+                s["ci95"][0],
+                s["ci95"][1],
+                "%.4f" % s["p_less"],
+                dz,
+                s["seeds_help"],
+                result["n_seeds"],
+            )
+        )
+    print("-" * 82)
+    print("  B-switch paired effect by world position (d = mechanism - bare prior)")
+    print("    world   change-bare CI             forget-bare CI")
+    for t in sorted(result["curve"]):
+        c, f = result["curve"][t]["change_minus_bare"], result["curve"][t]["forget_minus_bare"]
+        print(
+            "    %d      %6.2f [%6.2f, %6.2f]     %6.2f [%6.2f, %6.2f]"
+            % (t, c[2], c[0], c[1], f[2], f[0], f[1])
+        )
+    pooled = result["b_reduced_ci"]
+    print(
+        "  change vs bare, B worlds 2..%d pooled: mean d %6.2f  95%% CI [%6.2f, %6.2f]"
+        % (result["n_worlds"], sum(result["b_reduced"]) / len(result["b_reduced"]), pooled[0], pooled[1])
+    )
     print("-" * 82)
     for gate, ok in result["gates"].items():
         print("  %-22s : %s" % (gate.upper(), ok))

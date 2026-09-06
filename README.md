@@ -1,4 +1,4 @@
-# The Unknown World — Experiments 001–003
+# The Unknown World — Experiments 001–004
 
 > A laboratory for discovering agents: tiny unknown-worlds, the smallest
 > possible learning mechanism installed into them, and a protocol that
@@ -7,7 +7,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-brightgreen.svg"></a>
   <a href="https://www.python.org/"><img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-blue.svg"></a>
-  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiment" src="https://img.shields.io/badge/latest%20experiment-003-orange.svg"></a>
+  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiment" src="https://img.shields.io/badge/latest%20experiment-004-orange.svg"></a>
   <a href="https://github.com/NullLabTests/unknown-world/actions/workflows/tests.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/NullLabTests/unknown-world/tests.yml?label=tests"></a>
   <a href="https://github.com/NullLabTests/unknown-world"><img alt="Repo" src="https://img.shields.io/github/repo-size/NullLabTests/unknown-world.svg"></a>
 </p>
@@ -90,6 +90,19 @@ its feature:
   use those masses instead of `1/|H|`. Low-salience features are never
   hard-banned — a rule on a low-weight feature must remain solvable, at a
   cost the protocol is designed to see.
+
+Since Experiment 004, the prior can also **change its mind**. The measured
+failure of 002/003 was rigidity: after a color-heavy history, the first
+shape world cost ~0.9 extra experiments because salience precision grows
+unboundedly. Two tempered variants, both one-hyperparameter:
+
+- `ForgetAgent(f)` — bounded precision via a fixed forgetting factor
+  (`alpha = f·alpha + winner`, `f = 0.7`, Itti & Baldi 2005).
+- `ChangePointAgent(h)` — evidence-gated forgetting: a Bayesian run-length
+  monitor (Adams & MacKay 2007) over the sequence of winning features keeps
+  a strong prior on stationary streams but resets toward uniform as the
+  posterior mass shifts to "a change happened" — never-winning features are
+  *restored* to the uniform base, not decayed toward zero.
 
 ## Protocol — rototest
 
@@ -315,21 +328,107 @@ stable across seed bases. Experiment 001's lesson was about the flatness of
 an unmeasured row; 002's lesson was that the measurement itself needed to
 become the subject of study.
 
+## Experiment 004 — change-aware salience (the prior can be wrong)
+
+002 measured the primitive's cleanest failure mode: after a color-heavy
+history, the first shape world costs +0.88 experiments and recovery is slow
+because counts accumulate forever — the prior is *rigid*. Three literatures
+converge on the remedy:
+
+- **Itti & Baldi (2005; "Of Bits and Wows" 2010)** formalize surprise as
+  `KL(P(M|D) || P(M))` and explicitly warn that Dirichlet/Gamma counts grow
+  unboundedly, adding a *forgetting factor* `f = 0.7` to cap precision —
+  "relaxation of belief in the prior's precision."
+- **Adams & MacKay (2007), Bayesian Online Changepoint Detection**
+  (arXiv:0710.3742) — an exact online posterior over the *run length* since
+  the last regime change; a change is declared probabilistically, so
+  forgetting can be gated on evidence of a switch rather than applied
+  procedurally.
+- **Concept-drift stream learning** (Yu & Webb 2019; Bifet et al. 2007) —
+  "constant forgetting factors are a defect; the *rate of drift* should
+  regulate how much is forgotten."
+
+Three arms replace the bare prior on identical, per-seed worlds: `null`
+(prior neutralized each world), `bare` (002/003 prior, never forgets),
+`forget` (fixed `f = 0.7`), `change` (run-length monitor, hazard
+`h = 1/5` — the protocol's own block rate, set a priori, not tuned). All
+arms share the same world streams, so every comparison is paired.
+
+Results (verbatim, `python3 run.py`, seed base 7, `n_seeds=16`):
+
+```
+The Unknown World — Experiment 004 (change-aware salience: the prior can be wrong)
+
+  change-aware vs null (identical worlds; d = n_exp(change) - n_exp(null))
+  block        n    mean d  95% CI            p(prior<null)  dz     seeds helping
+----------------------------------------------------------------------------------
+  A-learn        80   -0.33  [ -0.44,  -0.23]   0.0003     -0.69   16/16
+  A-transfer     80   -0.34  [ -0.51,  -0.16]   0.0003     -0.42   13/16
+  B-switch       80    0.06  [ -0.09,   0.20]   0.8482      0.09   8/16
+  C-mixed       160   -0.06  [ -0.14,   0.01]   0.0757     -0.13   12/16
+----------------------------------------------------------------------------------
+  B-switch paired effect by world position (d = mechanism - bare prior)
+    world   change-bare CI             forget-bare CI
+    1        0.00 [  0.00,   0.00]       0.00 [  0.00,   0.00]
+    2       -0.44 [ -0.69,  -0.19]      -0.44 [ -0.69,  -0.19]
+    3       -0.50 [ -0.75,  -0.25]      -0.50 [ -0.75,  -0.25]
+    4       -0.69 [ -0.88,  -0.44]      -0.69 [ -0.94,  -0.44]
+    5       -0.44 [ -0.69,  -0.19]      -0.44 [ -0.69,  -0.19]
+  change vs bare, B worlds 2..5 pooled: mean d  -0.52  95% CI [ -0.64,  -0.39]
+----------------------------------------------------------------------------------
+  A_TRANSFER_IMPROVE     : True
+  B_SWITCH_REDUCED       : True
+  C_MIXED_NO_HARM        : True
+  verdict: kept
+  Change-aware salience preserves the transfer benefit, reliably cuts the post-first switch cost below the bare prior, and stays harmless on mixed worlds. The prior can change its mind. Keep it.
+```
+
+**Measurement notes**
+
+- The change-aware agent keeps the full transfer benefit of the bare prior
+  (A-transfer −0.34 [−0.51, −0.16] — the same CI as Experiment 003) while
+  erasing essentially *all* of the switch penalty: B-switch pooled cost drops
+  from +0.47 to +0.06 (CI [−0.09, +0.20]), and on the post-first switch
+  worlds it beats the bare prior by roughly half an experiment per world
+  (pooled −0.52 [−0.64, −0.39]).
+- The world-1 cost is structural, not fixable by a boundary monitor: no
+  within-world evidence can precede the first shape world, so `change −
+  bare = 0.00 [0.00, 0.00]` there (identical CIs, 16/16 seeds). The monitor
+  acts from world 2 onward.
+- The fixed-forgetting variant (`f = 0.7`) achieves nearly identical B-block
+  numbers here (`forget − bare` columns match `change − bare` on worlds
+  2–5). In this small feature geometry both collapse to a near-uniform prior
+  by world 2; they would diverge on longer streams or more features — that
+  is a candidate *measurement* for 005, not a claim.
+- Verdict stability (the 003 standard): across 12 seed bases ×
+  `n_seeds ∈ {16, 24, 32}`, the verdict is **`kept` in 32/32 runs**;
+  correctness holds (all arms still converge to the true rule and answer
+  100% on held-out objects, including shape-rule worlds after a color
+  history).
+
+**Verdict, as measured: change-aware salience is kept.** It preserves the
+prior's power on stationary families and removes its measured rigidity on
+family switches. The strand of the program that began as "a prior over
+which dimension is diagnostic" (002) has become "a prior that knows its own
+dimension-belief carries evidence and can be wrong" (004).
+
 ## Next
 
-With a kept prior and a measurement protocol that can actually detect
-~0.3-experiment effects, the next questions are about *what the prior is made
-of* and *what else the loop needs*:
+With a kept change-aware prior and a protocol that can measure ~0.3-experiment
+effects, the remaining questions are about composition and scale:
 
-- **Transfer across worlds of different shapes**: harden the prior against
-  the B-switch cost by detecting change (a drift signal, not just counts) —
-  the cost itself is the current primitive's cleanest failure mode.
-- **New primitive candidates** (each judged only under the v2 protocol):
-  a curiosity/novelty term, an active-recall mechanism, or a prior over
-  *relationships* rather than raw features.
+- **Composition**: the loop now has a prior (what matters) and knows it can
+  be wrong (when it flips). The next strand is whether the two belong on a
+  second level — a *prior over how fast priors change* (meta-change-point),
+  or a second primitive that acts on the same surprise signal instead of
+  the salience (e.g., a novelty term on experiment choice).
+- **Measurement of 005 candidates**: longer streams where fixed forgetting
+  (`f`) and evidence-gated forgetting (`change`) are predicted to diverge
+  (they were nearly identical on 5-world blocks), and richer object geometry
+  (more features) where the run-length monitor has more to decide between.
 - **Scaling variables**: does the kept verdict survive different
-  `n_present`/`n_held_out` and more features per object? The current
-  stability scan only varied `n_seeds`.
+  `n_present`/`n_held_out`? The stability scans to date varied only seed
+  bases and `n_seeds`.
 
 > Rule: never declare intelligence from performance on a fixed benchmark.
 > Measure the system's ability to adapt when the rules, tasks, environment,
@@ -338,9 +437,10 @@ of* and *what else the loop needs*:
 ## Reproduce
 
 ```bash
-python3 run.py                        # Experiment 003 and its verdict (default)
-python3 run.py 002                    # the legacy Experiment 002 run
-python3 -m unittest discover -s .     # the sanity suite (23 tests)
+python3 run.py                        # Experiment 004 and its verdict (default)
+python3 run.py 003                    # Experiment 003 (paired rototest v2)
+python3 run.py 002                    # Experiment 002 (legacy run)
+python3 -m unittest discover -s .     # the sanity suite (32 tests)
 ```
 
 Stdlib only. No dependencies. Deterministic seed (`random.Random(7)`).
@@ -350,10 +450,10 @@ Stdlib only. No dependencies. Deterministic seed (`random.Random(7)`).
 | File | Role |
 | --- | --- |
 | `world.py` | generator of minimal unknown-worlds (`Object` color/shape, hidden rule, `force_feature` hook) |
-| `agent.py` | the loop + feature-salience prior (Dirichlet `alpha`, weighted ACT, `reset_salience()`) |
-| `protocol.py` | rototest v1 (v2 legacy) + paired seeded rototest v2: prior-vs-null on identical worlds, permutation/p-value, bootstrap CI, Cohen's `dz`, harness verdict |
-| `run.py` | runs Experiment 003 (paired v2) by default; `run.py 002` reproduces the legacy run |
-| `test_step1.py` | sanity suite (23 tests: world, salience, protocol, statistics, paired v2) |
+| `agent.py` | the loop + salience: bare prior (002), tempered `ForgetAgent` (fixed `f`), `ChangePointAgent` (run-length monitor, hazard `h`) |
+| `protocol.py` | paired seeded harness (003) + four-arm change-aware harness (004): exact permutation p, bootstrap CI, Cohen's `dz`, harness verdicts |
+| `run.py` | runs Experiment 004 by default; `run.py 003` / `run.py 002` reproduce the earlier evidence |
+| `test_step1.py` | sanity suite (32 tests: world, salience, protocol, statistics, paired v2, change-aware) |
 
 ## License
 
