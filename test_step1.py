@@ -1,105 +1,91 @@
-"""Sanity tests for Step 1: world, minimal loop, rototest protocol."""
-
-from __future__ import annotations
-
 import random
 import unittest
 
-from agent import MinimalLoop
-from protocol import across_worlds, grade, within_world_curve
-from world import UnknownWorld
+from agent import Agent, predicts_open
+from protocol import run_rototest
+from world import UnknownWorld, FEATURE_DOMAINS, all_objects
 
 
-def run_world(agent, concept=None):
-    rng = random.Random(0)
-    world = UnknownWorld.generate(rng, concept=concept)
-    surviving, tests, curve = within_world_curve(agent, world)
-    return world, surviving, tests, curve
-
-
-class WorldTest(unittest.TestCase):
-    def test_rule_has_one_concept(self):
+class WorldTests(unittest.TestCase):
+    def test_force_feature_color(self):
         rng = random.Random(1)
         for _ in range(20):
-            world = UnknownWorld.generate(rng)
-            self.assertIn(world.concept[0], {"color", "shape"})
-            self.assertIn(world.concept[1], {"red", "blue", "green", "round", "square", "star"})
-            self.assertEqual(len(world.presented) + len(world.held_out), 9)
+            w = UnknownWorld.generate(rng, force_feature="color")
+            self.assertEqual(w.hidden_rule[0], "color")
+            self.assertIn(w.hidden_rule[1], FEATURE_DOMAINS["color"])
 
-    def test_effect_follows_rule(self):
+    def test_force_feature_shape(self):
         rng = random.Random(2)
-        for _ in range(20):
-            world = UnknownWorld.generate(rng)
-            feature, value = world.concept
-            for obj in world.presented + world.held_out:
-                self.assertEqual(obj.opens_door, obj.features[feature] == value)
+        w = UnknownWorld.generate(rng, force_feature="shape")
+        self.assertEqual(w.hidden_rule[0], "shape")
 
-
-class LoopTest(unittest.TestCase):
-    def test_converges_to_true_rule(self):
-        agent = MinimalLoop()
+    def test_population_has_match_and_mismatch(self):
         rng = random.Random(3)
-        for _ in range(50):
-            for concept in (None, ("color", "blue"), ("shape", "star")):
-                world = UnknownWorld.generate(rng, concept=concept)
-                surviving, tests, curve = within_world_curve(agent, world)
-                self.assertEqual(surviving, [world.concept], (concept, surviving))
-                self.assertLessEqual(tests, len(world.presented))
-
-    def test_held_out_perfect_once_converged(self):
-        agent = MinimalLoop()
-        rng = random.Random(4)
-        for _ in range(50):
-            world = UnknownWorld.generate(rng)
-            surviving, tests, curve = within_world_curve(agent, world)
-            self.assertEqual(curve[-1][1], 1.0)
-
-    def test_never_concept(self):
-        agent = MinimalLoop()
-        world = UnknownWorld.generate(random.Random(5), concept=None)
-        concept = ("*never", None)
-        world.concept = concept
-        for obj in world.presented + world.held_out:
-            obj.opens_door = False
-        surviving, tests, curve = within_world_curve(agent, world)
-        self.assertEqual(surviving, [concept])
-        self.assertEqual(curve[-1][1], 1.0)
-
-    def test_always_concept(self):
-        agent = MinimalLoop()
-        world = UnknownWorld.generate(random.Random(6), concept=None)
-        concept = ("*always", None)
-        world.concept = concept
-        for obj in world.presented:
-            obj.opens_door = True
-        surviving, tests, curve = within_world_curve(agent, world)
-        self.assertEqual(surviving, [concept])
+        w = UnknownWorld.generate(rng, force_feature="color")
+        m = sum(1 for o in w.objects if w.matches(o))
+        self.assertGreaterEqual(m, 1)
+        self.assertLess(m, len(w.objects))
 
 
-class RototestTest(unittest.TestCase):
-    def test_baseline_has_flat_learning_curve(self):
-        """Expected negative result: no learning-to-learn yet.
+class SalienceTests(unittest.TestCase):
+    def test_uniform_at_init(self):
+        a = Agent()
+        s = a.salience()
+        self.assertAlmostEqual(s["color"], s["shape"])
 
-        Tests-to-converge should be flat (within a small margin) across
-        worlds for the baseline loop. This documents the absence, so the
-        future primitive is only added when it produces a measurable change.
-        """
-        agent = MinimalLoop()
-        rng = random.Random(8)
-        worlds = [UnknownWorld.generate(rng) for _ in range(20)]
-        per_world = across_worlds(agent, worlds)
-        tests = [t for _, _, t, _ in per_world]
-        self.assertLessEqual(max(tests) - min(tests), 2)
+    def test_update_only_on_convergence(self):
+        a = Agent()
+        rng = random.Random(7)
+        w = UnknownWorld.generate(rng, force_feature="color")
+        result = a.run_world(w)
+        self.assertIsNotNone(result["rule"])
+        self.assertGreater(a.alpha["color"], a.alpha["shape"])
 
-    def test_grade_ties_are_not_competent(self):
-        agent = MinimalLoop()
-        rng = random.Random(9)
-        worlds = [UnknownWorld.generate(rng) for _ in range(10)]
-        agent.boot(worlds[0].presented)
-        score = grade(agent, worlds[0].held_out)
-        self.assertIsInstance(score, float)
-        self.assertGreaterEqual(score, 0.0)
-        self.assertLessEqual(score, 1.0)
+    def test_reset_salience(self):
+        a = Agent()
+        a.alpha["color"] = 9.0
+        a.reset_salience()
+        self.assertEqual(a.alpha["color"], 1.0)
+        self.assertAlmostEqual(a.salience()["color"], a.salience()["shape"])
+
+    def test_no_update_without_surviving_rule(self):
+        a = Agent()
+        before = dict(a.alpha)
+        a.hypotheses = []
+        a.note_convergence()
+        self.assertEqual(a.alpha, before)
+
+    def test_shape_still_solvable_after_color_prior(self):
+        a = Agent()
+        a.alpha["color"] = 20.0
+        a.alpha["shape"] = 1.0
+        rng = random.Random(11)
+        w = UnknownWorld.generate(rng, force_feature="shape")
+        result = a.run_world(w)
+        self.assertEqual(result["held_out"], 100.0)
+        self.assertIsNotNone(result["rule"])
+        self.assertEqual(result["rule"][0], "shape")
+
+    def test_uniform_choice_deterministic(self):
+        rng = random.Random(7)
+        w = UnknownWorld.generate(rng, force_feature="color")
+        a1, a2 = Agent(), Agent()
+        a1.begin_world(w)
+        a2.begin_world(w)
+        self.assertEqual(a1.next_experiment(), a2.next_experiment())
+
+
+class ProtocolTests(unittest.TestCase):
+    def test_rototest_deterministic(self):
+        r1 = run_rototest(seed=7)
+        r2 = run_rototest(seed=7)
+        self.assertEqual(r1["a_learn"], r2["a_learn"])
+        self.assertEqual(r1["verdict"], r2["verdict"])
+
+    def test_held_out_often_perfect(self):
+        r = run_rototest(seed=7)
+        perfect = sum(1 for row in r["rows"] if row["held_out"] == 100.0)
+        self.assertGreaterEqual(perfect, len(r["rows"]) - 2)
 
 
 if __name__ == "__main__":

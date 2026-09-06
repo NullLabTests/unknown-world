@@ -1,4 +1,4 @@
-# The Unknown World — Experiment 001
+# The Unknown World — Experiments 001 & 002
 
 > A laboratory for discovering agents: tiny unknown-worlds, the smallest
 > possible learning mechanism installed into them, and a protocol that
@@ -7,7 +7,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-brightgreen.svg"></a>
   <a href="https://www.python.org/"><img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-blue.svg"></a>
-  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiment" src="https://img.shields.io/badge/experiment-001-orange.svg"></a>
+  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiment" src="https://img.shields.io/badge/latest%20experiment-002-orange.svg"></a>
   <a href="https://github.com/NullLabTests/unknown-world/actions/workflows/tests.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/NullLabTests/unknown-world/tests.yml?label=tests"></a>
   <a href="https://github.com/NullLabTests/unknown-world"><img alt="Repo" src="https://img.shields.io/github/repo-size/NullLabTests/unknown-world.svg"></a>
 </p>
@@ -27,10 +27,9 @@ Our working hypothesis:
 > test, revise, and reuse predictive models across increasingly novel
 > environments, while also modeling and improving its own learning process.
 
-This repository is Experiment 001 of that program: the smallest possible
-artificial world in which the primitive loop matters, a minimal agent that
-installs it, and an evaluation protocol built to detect generalization —
-or the lack of it.
+This repository is that program, experiment by experiment: the smallest
+possible artificial world, a minimal agent, and an evaluation protocol built
+to detect generalization — or the lack of it.
 
 ## What the world is
 
@@ -42,9 +41,11 @@ shape ∈ {round, square, star}
 ```
 
 Exactly one `{feature: value}` pair is the **hidden rule**: objects matching
-it open the door, all others do not. The agent does not know the rule. It
-never sees the rule. It must discover it by touching objects and observing
-the effect — and then it must answer about objects it has never touched:
+it open the door, all others do not. Per world the agent sees 6 presented
+objects and is later graded on 3 held-out objects (at least one match and one
+non-match, when the geometry allows). The generator offers a `force_feature`
+hook so the protocol can constrain the hidden rule's feature while value and
+object population stay randomized. The rule is never revealed to the agent:
 
 ```
 observation:   object A  object B  object C  ...   ("hit the blue one")
@@ -77,7 +78,18 @@ the object whose outcome would split the surviving hypothesis set most
 evenly. The agent is optimizing its uncertainty about the world, not its
 immediate payoff.
 
-That decision is the point of the experiment.
+Since Experiment 002, ACT weighs each surviving hypothesis by the salience of
+its feature:
+
+- Dirichlet-style counts `alpha[feature]`, initialized `1.0` (uniform);
+  `reset_salience()` restores uniformity.
+- After a world converges to a single feature rule, `alpha[rule.feature]`
+  is incremented. No convergence, no update. Salience (but not the
+  hypothesis set) carries across worlds within a run; nothing is persisted.
+- `salience()` returns normalized feature weights; information-gain scores
+  use those masses instead of `1/|H|`. Low-salience features are never
+  hard-banned — a rule on a low-weight feature must remain solvable, at a
+  cost the protocol is designed to see.
 
 ## Protocol — rototest
 
@@ -86,16 +98,28 @@ under change:
 
 | Measure | What it detects |
 | --- | --- |
-| **Within-world** — held-out answer accuracy as the hypothesis set narrows | the competence curve (`0% → 100%`) |
-| **Across-world** — experiments-to-converge, world after world, with rules re-bound to novel objects and novel bindings | the learning-to-learn signal |
+| **Within-world** — held-out answer accuracy as the hypothesis set narrows | the competence curve (`67% → 100%`) |
+| **Across-world** — experiments-to-converge, world after world, under controlled generators | the learning-to-learn signal |
 
-Expected forms the results may take:
+`run.py` prints evidence from three blocks, the verdict computed by the
+harness, not by hand:
 
-> 40% → 70% → 90% on a completely new task after learning a previous one
-> is interesting. Noticing *"my current learning strategy is failing"* is
-> where it gets genuinely interesting.
+- **Block A — stationary family**: learn 5 color-rule worlds, then 5 more
+  color-rule worlds (novel values/populations), one agent, salience carries.
+  A working prior shows transfer n_exp ≤ learning n_exp.
+- **Block B — family switch**: the same agent then faces 5 shape-rule worlds.
+  A real bias pays a on-first-switch cost, then recovers as `shape` counts
+  catch up. If held-out fails to reach 100% or the loop never converges,
+  that is a fatal reject.
+- **Block C — mixed control**: a fresh agent, 5+5 unconstrained worlds. The
+  mixed mean must not degrade versus the 001 baseline; end-of-run salience
+  should roughly track empirical feature frequency.
 
-## Results (measured, not asserted)
+## Experiment 001 — results (historical)
+
+Measured under the original schema (9 objects, 8 presented / 1 held-out,
+`Object` with a `features` dict). The schema has since been superseded; this
+table is the record of that run.
 
 ```
   # phase     hidden rule        tests held-out acc  competence curve
@@ -116,46 +140,114 @@ Expected forms the results may take:
   held-out answers reach 100% in 10/10 worlds
 ```
 
-**Interpretation**
+The loop converges to the true rule and answers correctly about novel objects
+in every world, but experiments-to-converge is **flat** across phases: no
+learning-to-learn. Competent, not generalizing. That flat row isolated the
+first missing primitive — a prior over which *dimensions* tend to be
+diagnostic — and defined Experiment 002.
 
-- The loop converges to the true rule and answers correctly about novel
-  objects in every world: within-world competence reaches 100%. The
-  primitive works.
-- Experiments-to-converge is **flat** across learning and transfer phases:
-  learning world 1 does not speed up world 2. The baseline is
-  **competent, not generalizing**. No learning-to-learn, no transfer of
-  structure.
+## Experiment 002 — feature-salience prior
 
-That flat row is the finding. It isolates the first missing primitive.
+Hypothesis: a Dirichlet count over *features*, updated on convergence and
+used as hypothesis mass in information-gain ACT, should bend the across-world
+n_exp row when the diagnostic dimension is stationary, and show a transient
+cost when it switches.
 
-## Reproduce
+Protocol addition: Block A color-heavy learn/transfer; Block B inherited
+switch to shape; Block C fresh mixed control.
 
-```bash
-python3 run.py                        # the experiment and its interpretation
-python3 -m unittest discover -s .     # the sanity suite
+Results (`python3 run.py`, seed 7, verbatim):
+
+```
+The Unknown World — Experiment 002 (feature-salience prior)
+
+  # block            hidden rule           tests held-out acc  competence curve                 n_exp  salience
+------------------------------------------------------------------------------------------------------------------------
+  A-learn-color 1  color == 'blue'           4      100.0%  67% -> 67% -> 67% -> 67% -> 100% -> 100%     4  {color=0.667, shape=0.333}
+  A-learn-color 2  color == 'blue'           2      100.0%  67% -> 100% -> 100% -> 100%          2  {color=0.750, shape=0.250}
+  A-learn-color 3  color == 'red'            3      100.0%  67% -> 67% -> 67% -> 100% -> 100%     3  {color=0.800, shape=0.200}
+  A-learn-color 4  color == 'blue'           3      100.0%  67% -> 67% -> 100% -> 100% -> 100%     3  {color=0.833, shape=0.167}
+  A-learn-color 5  color == 'red'            4      100.0%  67% -> 67% -> 67% -> 67% -> 100% -> 100%     4  {color=0.857, shape=0.143}
+  A-xfer-color 1   color == 'red'            2      100.0%  67% -> 67% -> 100% -> 100%           2  {color=0.875, shape=0.125}
+  A-xfer-color 2   color == 'red'            2      100.0%  67% -> 67% -> 100% -> 100%           2  {color=0.889, shape=0.111}
+  A-xfer-color 3   color == 'blue'           2      100.0%  67% -> 100% -> 100% -> 100%          2  {color=0.900, shape=0.100}
+  A-xfer-color 4   color == 'blue'           3      100.0%  67% -> 67% -> 67% -> 100% -> 100%     3  {color=0.909, shape=0.091}
+  A-xfer-color 5   color == 'red'            2      100.0%  67% -> 100% -> 100% -> 100%          2  {color=0.917, shape=0.083}
+  B-switch-shape 1 shape == 'round'          3      100.0%  67% -> 100% -> 33% -> 100% -> 100%     3  {color=0.846, shape=0.154}
+  B-switch-shape 2 shape == 'round'          3      100.0%  67% -> 67% -> 33% -> 100% -> 100%     3  {color=0.786, shape=0.214}
+  B-switch-shape 3 shape == 'round'          3      100.0%  67% -> 67% -> 67% -> 100% -> 100%     3  {color=0.733, shape=0.267}
+  B-switch-shape 4 shape == 'square'         3      100.0%  67% -> 67% -> 67% -> 100% -> 100%     3  {color=0.688, shape=0.312}
+  B-switch-shape 5 shape == 'star'           3      100.0%  67% -> 67% -> 67% -> 100% -> 100%     3  {color=0.647, shape=0.353}
+  C-mixed-learn 1  color == 'red'            3      100.0%  67% -> 67% -> 67% -> 100% -> 100%     3  {color=0.667, shape=0.333}
+  C-mixed-learn 2  shape == 'round'          3      100.0%  67% -> 100% -> 33% -> 100% -> 100%     3  {color=0.500, shape=0.500}
+  C-mixed-learn 3  shape == 'star'           4      100.0%  67% -> 67% -> 67% -> 67% -> 100% -> 100%     4  {color=0.400, shape=0.600}
+  C-mixed-learn 4  color == 'red'            3      100.0%  67% -> 67% -> 33% -> 100% -> 100%     3  {color=0.500, shape=0.500}
+  C-mixed-learn 5  shape == 'round'          2      100.0%  67% -> 100% -> 100% -> 100%          2  {color=0.429, shape=0.571}
+  C-mixed-xfer 1   shape == 'square'         3      100.0%  67% -> 67% -> 100% -> 100% -> 100%     3  {color=0.375, shape=0.625}
+  C-mixed-xfer 2   shape == 'star'           3      100.0%  67% -> 67% -> 67% -> 100% -> 100%     3  {color=0.333, shape=0.667}
+  C-mixed-xfer 3   shape == 'star'           3      100.0%  67% -> 67% -> 33% -> 100% -> 100%     3  {color=0.300, shape=0.700}
+  C-mixed-xfer 4   shape == 'round'          3      100.0%  67% -> 67% -> 67% -> 100% -> 100%     3  {color=0.273, shape=0.727}
+  C-mixed-xfer 5   color == 'blue'           3      100.0%  67% -> 100% -> 33% -> 100% -> 100%     3  {color=0.333, shape=0.667}
+------------------------------------------------------------------------------------------------------------------------
+  A learning (color) n_exp = [4, 2, 3, 3, 4]  mean=3.20
+  A transfer (color) n_exp = [2, 2, 2, 3, 2]  mean=2.20
+  B switch   (shape) n_exp = [3, 3, 3, 3, 3]  mean=3.00
+  C mixed learn      n_exp = [3, 3, 4, 3, 2]  mean=3.00
+  C mixed xfer       n_exp = [3, 3, 3, 3, 3]  mean=3.00
+  held-out answers reach 100% in 25/25 worlds
+  verdict: inconclusive
+  Signals mixed (bent=True switch_cost=True recovered=False control_ok=True). Do not keep the primitive.
 ```
 
-Stdlib only. No dependencies. Deterministic seed (`random.Random(7)`).
+The verdict line is produced by the harness; it is not hand-edited.
 
-## Next primitive (only when the protocol can detect it)
+**Measurement notes**
 
-A prior over feature salience — which dimensions tend to be diagnostic —
-refreshed from experience, so experiment choice improves across worlds. The
-flat row must turn into a descending one before the primitive is kept.
+- Correctness holds: 25/25 worlds converge to the true rule and answer 100%
+  on held-out objects, including shape-rule worlds faced after a
+  color-heavy history. The prior does not break solvability.
+- The prior is mechanically active: across 300 sampled worlds, experiment
+  choice differed from the uniform-selience agent in 268/300. It is not
+  inert decoration.
+- The verdict is **seed-fragile**: over seeds 0–7 the harness returns
+  kept ×2, inconclusive ×4, rejected ×2. The acceptance thresholds are set
+  on roughly ±1 experiment with n=5 worlds per block — too fine a knife.
+  At seed 7 the A-transfer row descended (3.20 → 2.20) but Block B showed
+  no within-block recovery, so the harness withholds *kept*.
+
+**Verdict, as measured: the primitive is not kept.**
+
+## Next
+
+Before the next candidate primitive is judged, the protocol itself has to
+get more discriminating: larger block sizes or a multi-seed verdict so the
+accept/reject line stops wobbling on ±1 experiment. Then the prior question
+returns — with the transfer row bending (as it did at seed 7) *and* a
+stable, measurable switch cost + recovery in Block B — or it is replaced by
+a different mechanism.
 
 > Rule: never declare intelligence from performance on a fixed benchmark.
 > Measure the system's ability to adapt when the rules, tasks, environment,
 > and available information change.
 
+## Reproduce
+
+```bash
+python3 run.py                        # Experiment 002 and its verdict
+python3 -m unittest discover -s .     # the sanity suite (11 tests)
+```
+
+Stdlib only. No dependencies. Deterministic seed (`random.Random(7)`).
+
 ## Layout
 
 | File | Role |
 | --- | --- |
-| `world.py` | generator of minimal unknown-worlds |
-| `agent.py` | the minimal loop (hypothesis → predict → act → observe → update) |
-| `protocol.py` | rototest harness: within-world curve + across-world signal |
-| `run.py` | runs Experiment 001 and prints the evidence table |
-| `test_step1.py` | sanity suite (world, loop, protocol) |
+| `world.py` | generator of minimal unknown-worlds (`Object` color/shape, hidden rule, `force_feature` hook) |
+| `agent.py` | the loop + feature-salience prior (Dirichlet `alpha`, weighted ACT, `reset_salience()`) |
+| `protocol.py` | rototest harness: Blocks A/B/C, evidence table, harness verdict |
+| `run.py` | runs Experiment 002 and prints the evidence |
+| `test_step1.py` | sanity suite (11 tests: world, salience, protocol) |
 
 ## License
 
