@@ -1,4 +1,4 @@
-# The Unknown World — Experiments 001–005
+# The Unknown World — Experiments 001–006
 
 > A laboratory for discovering agents: tiny unknown-worlds, the smallest
 > possible learning mechanism installed into them, and a protocol that
@@ -7,7 +7,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-brightgreen.svg"></a>
   <a href="https://www.python.org/"><img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-blue.svg"></a>
-  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiment" src="https://img.shields.io/badge/latest%20experiment-005-orange.svg"></a>
+  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiment" src="https://img.shields.io/badge/latest%20experiment-006-orange.svg"></a>
   <a href="https://github.com/NullLabTests/unknown-world/actions/workflows/tests.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/NullLabTests/unknown-world/tests.yml?label=tests"></a>
   <a href="https://github.com/NullLabTests/unknown-world"><img alt="Repo" src="https://img.shields.io/github/repo-size/NullLabTests/unknown-world.svg"></a>
 </p>
@@ -115,6 +115,19 @@ recurrence). The salience counts are model-averaged over the hazard
 posterior — no single `h` is chosen by the experimenter. Experiment 005
 asks whether this zero-hand-set-prior agent *adapts* where the fixed
 `h = 1/5` is miscalibrated, without regressing where it was right.
+
+Since Experiment 006, the hazard is learned from the **observation stream**,
+not the compressed winner sequence. Experiment 005 updated the hierarchy once
+per world, at convergence, on the winning feature alone; the hazard proved
+statistically invisible in that two-feature geometry. The
+`ObservationHazardAgent` instead runs the exact standard BOCPD recursion
+(Wilson, Nassar, Gold & Kording 2010; Adams & MacKay 2007) *per observation*
+over the same hazards grid: one run-length trellis per candidate, updated at
+every touched object, with the change branch active only at world boundaries
+(a feature cannot change inside a world). The whole stream from each world
+now moves the hazard posterior, so an event rate — fast regimes
+(flip almost every world) vs slow regimes (one calm long tail after another)
+— finally has evidence to bite on.
 
 ## Protocol — rototest
 
@@ -553,26 +566,160 @@ sharp: it converts "the right move is learning the hazard" into "the right
 move is a world with more features, or a hazard evidence site with more
 signal".
 
+## Experiment 006 — the hazard learned per observation
+
+Experiment 005's failure was precise: the hazard was updated *once per world*,
+at convergence, from the single winning feature. The winner sequence is a
+compressed two-dimensional stream, and Wilson et al.'s marginal-predictive
+measure barely discriminates among hazards on it. Experiment 006 makes the
+harsh correction — **the fee is paid per observation, not per world**:
+
+The `ObservationHazardAgent` keeps the same grid of candidate hazards
+`h ∈ {1/2, 1/3, 1/4, 1/6, 1/8, 1/16, 1/32}` and one exact run-length trellis
+of `(run length, prob, Dirichlet-counts)` states per candidate, exactly like
+standard BOCPD, but the recursion fires on **every touched object**:
+
+- Each observation contributes its posterior predictive under each candidate
+  (`sum over states of prob × per-feature predictive`), accumulated into that
+  candidate's marginal log-likelihood — the Wilson et al. latent-rate
+  learning it always was.
+- The change branch (reset run, counts to uniform base) is gated to the
+  **first observation of each world**: the hidden *feature* can only change at
+  a world boundary, so the within-world observations are pure growth steps and
+  the hazard is asked to explain boundary events only.
+- The emission per state is the outcome's probability under that state's
+  per-feature value belief, computed from *within-world value evidence* — the
+  hidden value resets each world, so the value weights reset at every boundary.
+  A contradicted feature relaxes to 0.5 rather than dying instantly, so wrong
+  states drain away observation-by-observation instead of collapsing in one
+  step.
+
+Everything downstream is untouched: salience for ACT still updates only at
+convergence (`note_convergence` sets `alpha` to the hazard-posterior-weighted
+expected counts — the identical-machinery discipline), so the paired null
+control of Experiment 003 stays valid. Arms and blocks are identical to 005
+(`null` / `fixed h = 1/5` / `forget f = 0.7` / `learned`; B-home ρ=5,
+B-slow ρ=16, B-fast ρ=2 with a stationary A-block ahead of them).
+
+The deciding gate for 006 is about **identification, not behavior** — the
+thing 005 measured as missing:
+
+- `H_orders_fast_over_slow`: the learned hazard posterior mean after the
+  B-fast block must reliably exceed its value after the B-slow block
+  (per-seed paired `E[h|fast] − E[h|slow]`, bootstrap CI lower bound > 0.04).
+  True boundary-flip rates are 1/16 (slow) and 1/2 (fast): a monitor with
+  real hazard evidence must move `E[h]` up when the fast regime arrives.
+- `A_transfer_no_regression`: no loss of the stationary transfer benefit.
+- `C_mixed_no_harm`: mixed control within the non-inferiority margin.
+
+Results (verbatim, `python3 run.py`, seed base 7, `n_seeds=16`):
+
+```
+The Unknown World — Experiment 006 (the hazard learned per observation)
+
+  learned vs null (identical worlds; d = n_exp(learned) - n_exp(null))
+  block        n    mean d  95% CI            p(prior<null)  dz     seeds helping
+----------------------------------------------------------------------------------
+  A-learn        80   -0.50  [ -0.65,  -0.35]   0.0003     -0.69   16/16
+  A-transfer     80   -0.34  [ -0.51,  -0.16]   0.0003     -0.42   13/16
+  B-home        320   -0.44  [ -0.53,  -0.36]   0.0003     -0.53   16/16
+  B-slow        512   -0.51  [ -0.59,  -0.44]   0.0003     -0.61   16/16
+  B-fast        256   -0.07  [ -0.17,   0.04]   0.1278     -0.08   12/16
+  C-mixed       160   -0.06  [ -0.18,   0.05]   0.1770     -0.08   10/16
+----------------------------------------------------------------------------------
+  learned vs fixed h=1/5  (d = n_exp(learned) - n_exp(fixed))
+  block        n    mean d  95% CI
+  ----------------------------------------------
+  A-learn        80   -0.17  [ -0.30,  -0.05]
+  A-transfer     80    0.00  [  0.00,   0.00]
+  B-home        320   -0.21  [ -0.28,  -0.14]
+  B-slow        512   -0.04  [ -0.07,  -0.01]
+  B-fast        256   -0.05  [ -0.14,   0.03]
+  C-mixed       160    0.02  [ -0.09,   0.12]
+  ----------------------------------------------
+  effective hazard of the learned prior (posterior mean E[h], averaged over seeds)
+    after A          E[h] = 0.1257
+    after home       E[h] = 0.2163
+    after slow       E[h] = 0.1559
+    after fast       E[h] = 0.2970
+----------------------------------------------------------------------------------
+  H_order: per-seed E[h|post-fast] - E[h|post-slow]  mean  0.141  95% CI [ 0.138,  0.145]  (gate: lower > 0.04)
+----------------------------------------------------------------------------------
+  A_TRANSFER_NO_REGRESSION   : True
+  H_ORDERS_FAST_OVER_SLOW    : True
+  C_MIXED_NO_HARM            : True
+  verdict: kept
+  A monitor that learns its hazard at observation level preserves the stationary transfer benefit, reliably orders the fast regime's rate above the slow regime's rate, and stays harmless on mixed worlds. The prior's rate of forgetting is earned from the observation stream it lives in. Keep it.
+```
+
+**Measurement notes**
+
+- **The hazard is now identifiable.** The `E[h]` trajectory is the exact
+  trajectory theory predicts and 005 conspicuously did *not* produce: 0.126
+  after the calm stationary A-block, 0.216 after home (ρ = 5 ≈ 1/5), a dip to
+  0.156 after the slow calm tails (ρ = 16), then a spike to 0.297 after the
+  fast block (ρ = 2). The dip-then-spike ordering is exactly the ordering of
+  the true rates, and it is monotone *against* stream order — it cannot be a
+  drift artifact. The per-observation stream, which records the boundary +
+  growth structure of every world, carries the hazard evidence that the
+  per-world winner sequence could not.
+- **H_order is the strongest number in the experiment**: mean 0.141, 95% CI
+  [0.138, 0.145] against a pre-committed margin of 0.04 — three and a half
+  margins of clearance. It passes at *every* seed base scanned below.
+- **The behavioral readout is quieter.** B-fast learned-vs-null is −0.07
+  [−0.17, 0.04], and C-mixed is flat. The monitor *identifies* the two rates
+  cleanly, but in this short protocol the identified hazard does not yet buy a
+  measurable per-world n_exp advantage on the fast block (the learned prior is
+  never worse here either — B-fast learned beats fixed h = 1/5 by −0.05). 005
+  was dominated by the identification failure; with identification now
+  recovered, the behavioral dividend is the natural next scale to chase.
+- **Verdict stability across seed bases {5, 6, 7, 8, 9} at `n_seeds` = 16:**
+  kept ×4, inconclusive ×1. The single wobble (base 6) is the pre-existing
+  C_mixed_no_harm non-inferiority gate — its 95% CI upper bound crosses the
+  0.25 margin (0.33) while A_transfer and H_order both pass at every base
+  (H_order CI lower ≈ 0.139 everywhere). The C gate measures *world-draw
+  composition* of the unconstrained mixed control, not hazard learning: it is
+  the same seed-fragility the 002/003 records diagnosed, now localized to the
+  one block left in the suite with unforced features. H_order — the gate that
+  implements "does the learned rate track the stream's rate" — is stable in
+  5/5 seed bases at both `n_seeds = 16` and `n_seeds = 24`.
+- **Discretization honesty**: the agent carries one run-length trellis per
+  candidate hazard on the grid and model-averages them; the full three-level
+  hierarchy (learning the hazard *over* hazards, per Wilson et al.'s latent
+  `a`/`b` recursion) is deliberately not implemented. The grid is a faithful
+  two-level discretization of the same recurrence and is what lets the
+  evidence site (per-observation) be tested against the 005 control unconfounded.
+  A true three-level hierarchy is the next candidate, not a fix.
+
+**Verdict, as measured: the per-observation hazard learner is kept.** The
+regression 005 identified — collapsing each world to a single convergence
+update — is repaired by paying the Bayesian recursion at the observation
+level, and the rate that was statistically invisible now tracks the stream
+with decisive margin. This is the first mechanism in the program whose *rate
+of forgetting* is a measurement, in the sense that the value printed by the
+posterior tracks the environment it lives in.
+
 ## Next
 
-Experiment 005 measured *why* the hazard is hard to learn: with two features
-the winner sequence carries almost no hazard information. The next strand is
-therefore about giving the learning machinery something to decide between:
+Experiment 006 recovered hazard *identification* by moving the recursion to
+the per-observation stream. The open directions:
 
-- **Richer geometry**: a third feature (and finer held-out structure) so
-  the run-length monitor and the hazard posterior have more dimensions to
-  be wrong about. This is the direct follow-up; the f-vs-change divergence
-  prediction carries over and becomes measurable.
-- **A different hazard evidence site**: instead of (or in addition to) the
-  winner-feature sequence, monitor the prior's *own* convergence cost over
-  time — n_exp per world is itself a signal of surprise at regime changes,
-  a meta-level "am I paying more than I should?" term.
-- **Keep the regime-stream protocol**: repeated in-block switches (rather
-  than 004's single switch) are what give an online learner repeated events —
-  the prerequisite for estimating an event rate at all.
-- **Scaling variables**: does the kept verdict survive different
-  `n_present`/`n_held_out`? The stability scans to date varied only seed
-  bases and `n_seeds`.
+- **The behavioral dividend.** The identified hazard (post-fast E[h] ≈ 0.30)
+  does not yet buy a clean B-fast n_exp advantage. Longer regime streams,
+  mixed-rate blocks, or a richer geometry should let the learned rate earn a
+  faster recovery where fixed `h = 1/5` under-anticipates change.
+- **A true three-level hierarchy.** The grid is currently pre-committed;
+  Wilson et al.'s latent-rate recursion (`a`, `b` posteriors over the hazard
+  itself) removes even the grid. It should inherit the identification result
+  and sharpen it where the grid is coarse (h = 1/3 vs 1/4).
+- **A third feature.** The 005→006 record shows the hazard monitor needs
+  *evidence* more than *machinery*; a third feature gives a run-length model a
+  second dimension to be wrong about and converts the f-vs-change divergence
+  prediction (004) into a measurement.
+- **The metacognitive strand.** Two-literature direction: hazard evidence from
+  the prior's *own* convergence cost (n_exp is itself a surprise signal), and
+  a self-model of the learning loop (Haber et al. 2018; Liu & van der Schaar,
+  arXiv:2506.05109). Both are 007 candidates, not yet scheduled.
 
 > Rule: never declare intelligence from performance on a fixed benchmark.
 > Measure the system's ability to adapt when the rules, tasks, environment,
@@ -581,11 +728,12 @@ therefore about giving the learning machinery something to decide between:
 ## Reproduce
 
 ```bash
-python3 run.py                        # Experiment 005 and its verdict (default)
+python3 run.py                        # Experiment 006 and its verdict (default)
+python3 run.py 005                    # Experiment 005 (hazard learned from the winner sequence)
 python3 run.py 004                    # Experiment 004 (change-aware salience)
 python3 run.py 003                    # Experiment 003 (paired rototest v2)
 python3 run.py 002                    # Experiment 002 (legacy run)
-python3 -m unittest discover -s .     # the sanity suite (40 tests)
+python3 -m unittest discover -s .     # the sanity suite (47 tests)
 ```
 
 Stdlib only. No dependencies. Deterministic seed (`random.Random(7)`).
@@ -595,10 +743,10 @@ Stdlib only. No dependencies. Deterministic seed (`random.Random(7)`).
 | File | Role |
 | --- | --- |
 | `world.py` | generator of minimal unknown-worlds (`Object` color/shape, hidden rule, `force_feature` hook) |
-| `agent.py` | the loop + salience: bare prior (002), tempered `ForgetAgent` (fixed `f`), `ChangePointAgent` (run-length monitor, hazard `h`), `HierarchicalChangePointAgent` (learned hazard over a grid, 005) |
-| `protocol.py` | paired seeded harness (003), four-arm change-aware harness (004), regime-stream harness with hazard gates (005): exact permutation p, bootstrap CI, Cohen's `dz`, harness verdicts |
-| `run.py` | runs Experiment 005 by default; `run.py 004` / `003` / `002` reproduce the earlier evidence |
-| `test_step1.py` | sanity suite (40 tests: world, salience, protocol, statistics, paired v2, change-aware, hierarchy) |
+| `agent.py` | the loop + salience: bare prior (002), tempered `ForgetAgent` (fixed `f`), `ChangePointAgent` (run-length monitor, hazard `h`), `HierarchicalChangePointAgent` (learned hazard over a grid, 005), `ObservationHazardAgent` (per-observation learned hazard, 006) |
+| `protocol.py` | paired seeded harness (003), four-arm change-aware / regime-stream harnesses (004–006): exact permutation p, bootstrap CI, Cohen's `dz`, hazard-identification gates, harness verdicts |
+| `run.py` | runs Experiment 006 by default; `run.py 005` / `004` / `003` / `002` reproduce the earlier evidence |
+| `test_step1.py` | sanity suite (47 tests: world, salience, protocol, statistics, paired v2, change-aware, hierarchy, observation-hazard) |
 
 ## License
 

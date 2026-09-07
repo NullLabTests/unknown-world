@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 
-from world import FEATURES, all_atomic_rules
+from world import FEATURES, FEATURE_DOMAINS, all_atomic_rules
 
 ALWAYS = ("*", "always")
 NEVER = ("*", "never")
@@ -393,4 +393,154 @@ class HierarchicalChangePointAgent(Agent):
             exp = self._expected_counts_trellis(runs)
             for f in self.features:
                 out[f] += w * exp[f]
+        self.alpha = out
+
+
+# ---------------------------------------------------------------------------
+# Experiment 006: the hazard learned *per observation* (adaptive hazard)
+# ---------------------------------------------------------------------------
+
+
+class ObservationHazardAgent(Agent):
+    """Per-observation run-length monitor with an earned hazard (Experiment 006).
+
+    Experiment 005 inferred the hazard from a *compressed* stream: one winner
+    feature per world, updated only at convergence. Standard BOCPD
+    (Adams & MacKay 2007; Wilson, Nassar & Gold 2010) instead updates at
+    every *observation*, and that is what this agent does. The regime
+    variable is the *feature* of the hidden rule, which can only change at a
+    world boundary; the change hazard is inferred from the stream rather than
+    set by the experimenter.
+
+    Mechanics, per observation (object touched + outcome):
+
+    - Each candidate hazard on HAZARD_GRID carries one exact run-length
+      trellis of nodes ``(r, p, c)`` where ``c`` is a Dirichlet belief over
+      which feature the current run is governed by. A change resets the run
+      (r=0, c back to the uniform base); growth carries r+1 and keeps c.
+    - The transition prior is *boundary-aware*: a feature cannot change
+      inside a world, so the hazard-weighted change branch is only active on
+      the first observation of each world. This is exactly the regression
+      that 005 collapsed: the world boundary (not every world convergence)
+      is the hazard event.
+    - The emission is the marginal predictive of the outcome under each
+      feature, computed from *within-world value evidence* (the hidden value
+      is fresh every world, so the value belief resets at every boundary).
+      The whole observation stream therefore moves the hazard posterior,
+      not just the winning feature.
+
+    Salience for ACT is recomputed only at world convergence (note the
+    identical-machinery discipline of Experiment 003): within a world the
+    agent behaves exactly like the base Agent given the same alpha, so the
+    paired null control stays valid.
+    """
+
+    def __init__(self, features=None, hazards=HAZARD_GRID, run_cap=20, max_states=64):
+        super().__init__(features)
+        self.hazards = tuple(hazards)
+        self.run_cap = run_cap
+        self.max_states = max_states
+        self.reset_salience()
+
+    def reset_salience(self):
+        super().reset_salience()
+        self.hazard_logliks = [0.0] * len(self.hazards)
+        self.trellises = [
+            [(0, 1.0, {f: 1.0 for f in self.features})] for _ in self.hazards
+        ]
+        self.value_weights = {
+            f: {v: 1.0 for v in FEATURE_DOMAINS[f]} for f in self.features
+        }
+        self._boundary_pending = True
+
+    def begin_world(self, world):
+        super().begin_world(world)
+        self.value_weights = {
+            f: {v: 1.0 for v in FEATURE_DOMAINS[f]} for f in self.features
+        }
+        self._boundary_pending = True
+
+    def hazard_posterior(self):
+        peak = max(self.hazard_logliks)
+        weights = [math.exp(x - peak) for x in self.hazard_logliks]
+        total = sum(weights) or 1.0
+        return [w / total for w in weights]
+
+    def _feature_predictive(self, obj, opened):
+        """Per-feature likelihood of this observation given value evidence.
+
+        For each feature f the likelihood is the posterior predictive of the
+        outcome under the world's hidden value given the observations of the
+        current world. A feature the current world outright contradicts
+        returns 0.5 (maximal uncertainty) rather than 0, so contradicted
+        nodes drain away observation-by-observation instead of dying in one
+        step.
+        """
+        out = {}
+        for f in self.features:
+            w = self.value_weights[f]
+            total = sum(w.values())
+            if total <= 0:
+                out[f] = 0.5
+                continue
+            p_open = sum(w[v] for v in w if getattr(obj, f) == v) / total
+            out[f] = p_open if opened else (1.0 - p_open)
+        return out
+
+    def observe(self, obj, opened):
+        super().observe(obj, opened)
+        lik = self._feature_predictive(obj, opened)
+        boundary = self._boundary_pending
+        self._boundary_pending = False
+
+        base = {f: 1.0 for f in self.features}
+        new_trellises = []
+        ll_deltas = []
+        for runs, hazard in zip(self.trellises, self.hazards):
+            new_runs = []
+            for r, p, c in runs:
+                tot = sum(c.values())
+                if tot <= 0:
+                    continue
+                em = sum((c[f] / tot) * lik[f] for f in self.features)
+                cfeat = {f: c[f] * lik[f] for f in self.features}
+                if boundary:
+                    new_runs.append(
+                        (min(r + 1, self.run_cap), p * (1.0 - hazard) * em, cfeat)
+                    )
+                    new_runs.append((0, p * hazard * em, dict(base)))
+                else:
+                    new_runs.append((min(r + 1, self.run_cap), p * em, cfeat))
+            ll_delta = sum(p for _, p, _ in new_runs) or 1e-300
+            ll_deltas.append(ll_delta)
+
+            new_runs.sort(key=lambda s: -s[1])
+            if len(new_runs) > self.max_states:
+                new_runs = new_runs[: self.max_states]
+            total_p = sum(p for _, p, _ in new_runs) or 1.0
+            new_runs = [(r, p / total_p, c) for r, p, c in new_runs]
+            new_trellises.append(new_runs)
+
+        self.trellises = new_trellises
+        for j, ll in enumerate(ll_deltas):
+            self.hazard_logliks[j] += math.log(ll)
+
+        matched = {f: getattr(obj, f) for f in self.features}
+        for f in self.features:
+            w = self.value_weights[f]
+            for v in w:
+                if (v == matched[f]) != opened:
+                    w[v] = 0.0
+
+    def note_convergence(self):
+        rule = self.surviving_rule()
+        if rule is None:
+            return
+        weights = self.hazard_posterior()
+        out = {f: 0.0 for f in self.features}
+        for w, runs in zip(weights, self.trellises):
+            total = sum(p for _, p, _ in runs) or 1.0
+            for _, p, c in runs:
+                for f in self.features:
+                    out[f] += w * (p / total) * c[f]
         self.alpha = out

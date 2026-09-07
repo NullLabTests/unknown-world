@@ -12,7 +12,13 @@ from __future__ import annotations
 import random
 import statistics
 
-from agent import Agent, ForgetAgent, ChangePointAgent, HierarchicalChangePointAgent
+from agent import (
+    Agent,
+    ForgetAgent,
+    ChangePointAgent,
+    HierarchicalChangePointAgent,
+    ObservationHazardAgent,
+)
 from world import UnknownWorld
 
 BLOCKS = ("A-learn", "A-transfer", "B-switch", "C-mixed")
@@ -942,6 +948,255 @@ def print_005_report(result):
         vals = result["hazard_eff"]["learned"][name]
         mean_h = sum(vals) / len(vals) if vals else 0.0
         print("    after %-8s   E[h] = %.4f" % (name.replace("post-", ""), mean_h))
+    print("-" * 82)
+    for gate, ok in result["gates"].items():
+        print("  %-26s : %s" % (gate.upper(), ok))
+    print("  verdict: %s" % result["verdict"])
+    print("  %s" % result["why"])
+
+
+# ---------------------------------------------------------------------------
+# Experiment 006: the hazard learned *per observation* (adaptive hazard)
+# ---------------------------------------------------------------------------
+
+H_MARGIN = 0.04  # pre-committed ordering margin for the fast>slow hazard gate
+
+ARMS_006 = ("null", "fixed", "forget", "learned")
+
+
+def _arm_factory_006(arm):
+    if arm == "fixed":
+        return lambda: ChangePointAgent(hazard=1.0 / 5.0)
+    if arm == "forget":
+        return lambda: ForgetAgent(forget=0.7)
+    if arm == "learned":
+        return lambda: ObservationHazardAgent()
+    return Agent
+
+
+def _rototest_006_arms(seed, n_worlds, n_seeds):
+    """Return per-arm step lists, B-position lists, and per-seed hazard means."""
+    block_len = {"A-learn": n_worlds, "A-transfer": n_worlds, "C-mixed": N_MIXED}
+    for p in PACES:
+        block_len["B-" + p] = _pace_length(p)
+
+    per_arm = {a: {b: [] for b in BLOCKS_005} for a in ARMS_006}
+    b_pos = {
+        a: {p: {t: [] for t in range(1, block_len["B-" + p] + 1)} for p in PACES}
+        for a in ARMS_006
+    }
+    hazard_seeds = []
+    slow_tail = {a: [] for a in ARMS_006}
+
+    order = ("A-learn", "A-transfer", "B-home", "B-slow", "B-fast", "C-mixed")
+
+    for s in range(n_seeds):
+        srng = random.Random(seed * 10000 + s)
+        segs = {
+            "A-learn": [UnknownWorld.generate(srng, force_feature="color") for _ in range(n_worlds)],
+            "A-transfer": [UnknownWorld.generate(srng, force_feature="color") for _ in range(n_worlds)],
+            "B-home": _regime_worlds(srng, REGIME_WIDTHS["home"], PACES_START["home"]),
+            "B-slow": _regime_worlds(srng, REGIME_WIDTHS["slow"], PACES_START["slow"]),
+            "B-fast": _regime_worlds(srng, REGIME_WIDTHS["fast"], PACES_START["fast"]),
+            "C-mixed": [UnknownWorld.generate(srng) for _ in range(N_MIXED)],
+        }
+
+        for arm in ARMS_006:
+            factory = _arm_factory_006(arm)
+            if arm == "null":
+                agent = factory()
+                runs = {b: run_null_sequence(agent, segs[b]) for b in order}
+            else:
+                agent = factory()
+                prior_blocks = ("A-learn", "A-transfer", "B-home", "B-slow", "B-fast")
+                runs = {}
+                for b in prior_blocks:
+                    runs[b] = run_prior_sequence(agent, segs[b])
+                    if arm == "learned":
+                        if b == "A-learn":
+                            hazard_seeds.append(dict.fromkeys(
+                                ("post-A", "post-home", "post-slow", "post-fast"), 0.0
+                            ))
+                        if b == "A-transfer":
+                            hazard_seeds[-1]["post-A"] = _effective_hazard(agent)
+                        if b == "B-home":
+                            hazard_seeds[-1]["post-home"] = _effective_hazard(agent)
+                        if b == "B-slow":
+                            hazard_seeds[-1]["post-slow"] = _effective_hazard(agent)
+                        if b == "B-fast":
+                            hazard_seeds[-1]["post-fast"] = _effective_hazard(agent)
+                fresh = factory()
+                runs["C-mixed"] = run_prior_sequence(fresh, segs["C-mixed"])
+
+            for b in order:
+                res_list = runs[b]
+                per_arm[arm][b].extend(r["steps"] for r in res_list)
+                if b.startswith("B-"):
+                    pace = b[2:]
+                    for t, r in enumerate(res_list, start=1):
+                        b_pos[arm][pace][t].append(r["steps"])
+                if b == "B-slow":
+                    for t, r in enumerate(res_list, start=1):
+                        if (t - 1) % REGIME_WIDTHS["slow"][0] + 1 >= 9:
+                            slow_tail[arm].append(r["steps"])
+
+    return per_arm, b_pos, hazard_seeds, slow_tail
+
+
+def _effective_hazard(agent):
+    """Posterior-mean hazard E[h] of a hazard-learning agent."""
+    hps = agent.hazard_posterior()
+    return sum(w * h for w, h in zip(hps, agent.hazards))
+
+
+def rototest_006(seed=7, n_worlds=5, n_seeds=16, h_margin=H_MARGIN):
+    """Does a *per-observation* hazard learner retrieve the regime rate?
+
+    Experiment 005 compressed each world into a single winner feature and
+    updated the hazard posterior only at convergence; the hazard proved
+    unidentifiable from that 2-feature winner sequence. Experiment 006 feeds
+    the same regime streams to `ObservationHazardAgent`, which runs an exact
+    run-length trellis per candidate hazard updated at every *observation*,
+    with the change branch active only at world boundaries (a feature cannot
+    change inside a world). The protocol is otherwise identical to 005
+    (identical worlds, arms null/fixed/forget/learned).
+
+    The deciding gate is about *identification*, not behaviour:
+    - H_orders_fast_over_slow: the learned hazard's posterior mean after the
+      B-fast block reliably exceeds its value after the B-slow block by more
+      than `h_margin`. The true boundary-flip rates are 1/16 (slow) and 1/2
+      (fast) per world; a monitor with real hazard evidence must move E[h]
+      up when the fast regime arrives.
+    - A_transfer_no_regression: learned is not worse than null on the
+      stationary A-transfer benefit (identical-machinery discipline).
+    - C_mixed_no_harm: learned is not worse than null by more than the
+      non-inferiority margin on mixed worlds.
+
+    Keep the primitive only if the per-observation monitor orders the rates
+    it is asked to live with, without breaking the prior's measured benefits.
+    """
+    per_arm, b_pos, hazard_seeds, slow_tail = _rototest_006_arms(seed, n_worlds, n_seeds)
+
+    saw = {b: len(per_arm["learned"][b]) // n_seeds for b in BLOCKS_005}
+
+    ln = {b: _pair_blocks(per_arm["learned"][b], per_arm["null"][b]) for b in BLOCKS_005}
+    lf = {b: _pair_blocks(per_arm["learned"][b], per_arm["fixed"][b]) for b in BLOCKS_005}
+
+    stats_ln = {}
+    for i, b in enumerate(BLOCKS_005):
+        per_seed = []
+        wpt = saw[b]
+        for s in range(n_seeds):
+            chunk = ln[b][s * wpt : (s + 1) * wpt]
+            per_seed.append(sum(chunk) / len(chunk))
+        stats_ln[b] = _block_stats(b, i, ln[b], per_seed, seed)
+
+    h_eff = {k: [d[k] for d in hazard_seeds] for k in ("post-A", "post-home", "post-slow", "post-fast")}
+    h_order_ds = [f - s for f, s in zip(h_eff["post-fast"], h_eff["post-slow"])]
+    h_order_ci = bootstrap_ci(h_order_ds, _resample_seed(seed, 211))
+
+    a_ci = bootstrap_ci(ln["A-transfer"], _resample_seed(seed, 212))
+    c_ci = bootstrap_ci(ln["C-mixed"], _resample_seed(seed, 213))
+
+    a_improve = a_ci[1] < 0.0
+    h_ok = h_order_ci[0] > h_margin
+    no_harm = c_ci[1] < C_MARGIN
+
+    gates = {
+        "A_transfer_no_regression": a_improve,
+        "H_orders_fast_over_slow": h_ok,
+        "C_mixed_no_harm": no_harm,
+    }
+
+    if all(gates.values()):
+        verdict = "kept"
+        why = (
+            "A monitor that learns its hazard at observation level preserves the "
+            "stationary transfer benefit, reliably orders the fast regime's rate "
+            "above the slow regime's rate, and stays harmless on mixed worlds. "
+            "The prior's rate of forgetting is earned from the observation "
+            "stream it lives in. Keep it."
+        )
+    elif not a_improve:
+        verdict = "rejected"
+        why = (
+            "Per-observation hazard learning lost the transfer benefit over the "
+            "identical-machinery control: the monitor broke the prior."
+        )
+    else:
+        verdict = "inconclusive"
+        why = (
+            "Signals mixed (A_improve=%s H_order=%s no_harm=%s). Do not keep "
+            "the primitive." % (a_improve, h_ok, no_harm)
+        )
+
+    return {
+        "stats_ln": stats_ln,
+        "lf": lf,
+        "hazard_eff": h_eff,
+        "h_order_ds": h_order_ds,
+        "h_order_ci": h_order_ci,
+        "h_margin": h_margin,
+        "slow_tail_steps": slow_tail,
+        "saw": saw,
+        "a_ci": a_ci,
+        "c_ci": c_ci,
+        "gates": gates,
+        "verdict": verdict,
+        "why": why,
+        "n_seeds": n_seeds,
+        "n_worlds": n_worlds,
+        "seed_base": seed,
+    }
+
+
+def print_006_report(result):
+    saw = result["saw"]
+    stats = result["stats_ln"]
+    print("  learned vs null (identical worlds; d = n_exp(learned) - n_exp(null))")
+    print(
+        "  block        n    mean d  95% CI            p(prior<null)  dz     seeds helping"
+    )
+    print("-" * 82)
+    for b in BLOCKS_005:
+        s = stats[b]
+        dz = "  n/a" if s["dz"] is None else "%5.2f" % s["dz"]
+        print(
+            "  %-12s %4d  %6.2f  [%6.2f, %6.2f]   %s     %s   %d/%d"
+            % (
+                b,
+                s["n"],
+                s["mean"],
+                s["ci95"][0],
+                s["ci95"][1],
+                "%.4f" % s["p_less"],
+                dz,
+                s["seeds_help"],
+                result["n_seeds"],
+            )
+        )
+    print("-" * 82)
+    print("  learned vs fixed h=1/5  (d = n_exp(learned) - n_exp(fixed))")
+    print("  block        n    mean d  95% CI")
+    print("  " + "-" * 46)
+    for b in BLOCKS_005:
+        ds = result["lf"][b]
+        lo, hi, m = bootstrap_ci(ds, _resample_seed(result["seed_base"], 300 + BLOCKS_005.index(b)))
+        print("  %-12s %4d  %6.2f  [%6.2f, %6.2f]" % (b, len(ds), m, lo, hi))
+    print("  " + "-" * 46)
+
+    print("  effective hazard of the learned prior (posterior mean E[h], averaged over seeds)")
+    for name in ("post-A", "post-home", "post-slow", "post-fast"):
+        vals = result["hazard_eff"][name]
+        mean_h = sum(vals) / len(vals) if vals else 0.0
+        print("    after %-8s   E[h] = %.4f" % (name.replace("post-", ""), mean_h))
+    print("-" * 82)
+
+    lo, hi, m = result["h_order_ci"]
+    print(
+        "  H_order: per-seed E[h|post-fast] - E[h|post-slow]  mean %6.3f  95%% CI [%6.3f, %6.3f]  (gate: lower > %4.2f)"
+        % (m, lo, hi, result["h_margin"])
+    )
     print("-" * 82)
     for gate, ok in result["gates"].items():
         print("  %-26s : %s" % (gate.upper(), ok))

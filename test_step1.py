@@ -1,9 +1,18 @@
 import random
 import unittest
 
-from agent import Agent, ChangePointAgent, ForgetAgent, HAZARD_GRID, HierarchicalChangePointAgent, predicts_open
+from agent import (
+    Agent,
+    ChangePointAgent,
+    ForgetAgent,
+    HAZARD_GRID,
+    HierarchicalChangePointAgent,
+    ObservationHazardAgent,
+    predicts_open,
+)
 from protocol import (
     BLOCKS_005,
+    _effective_hazard,
     _regime_worlds,
     bootstrap_ci,
     cohens_dz,
@@ -11,6 +20,7 @@ from protocol import (
     permutation_pvalue,
     rototest_004,
     rototest_005,
+    rototest_006,
     run_null_sequence,
     run_prior_sequence,
     run_rototest,
@@ -345,6 +355,82 @@ class HierarchyTests(unittest.TestCase):
             self.assertEqual(r1["stats_ln"][b]["ci95"], r2["stats_ln"][b]["ci95"])
         self.assertEqual(r1["verdict"], r2["verdict"])
         self.assertEqual(r1["gates"], r2["gates"])
+
+
+class ObservationHazardTests(unittest.TestCase):
+    def _stream(self, feature, n, seed=7):
+        rng = random.Random(seed)
+        return [UnknownWorld.generate(rng, force_feature=feature) for _ in range(n)]
+
+    def test_reset_uniform(self):
+        h = ObservationHazardAgent()
+        for w in self._stream("color", 3):
+            h.run_world(w)
+        h.reset_salience()
+        self.assertAlmostEqual(h.salience()["color"], h.salience()["shape"])
+        self.assertEqual(len(h.trellises), len(HAZARD_GRID))
+        for runs in h.trellises:
+            self.assertEqual(len(runs), 1)
+        self.assertEqual(h.hazard_logliks, [0.0] * len(HAZARD_GRID))
+        self.assertTrue(h._boundary_pending)
+
+    def test_fresh_world_equals_bare(self):
+        for seed in (1, 5, 9):
+            rng = random.Random(seed)
+            w = UnknownWorld.generate(rng)
+            a, h = Agent(), ObservationHazardAgent()
+            self.assertEqual(a.run_world(w)["steps"], h.run_world(w)["steps"])
+            self.assertEqual(a.run_world(w)["held_out"], h.run_world(w)["held_out"])
+
+    def test_stationary_twenty_worlds_learns_slow(self):
+        h = ObservationHazardAgent()
+        for w in self._stream("color", 20):
+            h.run_world(w)
+        ws = h.hazard_posterior()
+        slow = sum(w for w, hh in zip(ws, h.hazards) if hh <= 1.0 / 8.0)
+        fast = sum(w for w, hh in zip(ws, h.hazards) if hh >= 1.0 / 2.0)
+        self.assertGreater(slow, fast)
+
+    def test_fast_stream_orders_hazard_above_slow(self):
+        h = ObservationHazardAgent()
+        for w in self._stream("color", 5):
+            h.run_world(w)
+        rng = random.Random(3)
+        for w in _regime_worlds(rng, (16, 16), "shape"):
+            h.run_world(w)
+        slow_h = _effective_hazard(h)
+        seed = 4
+        for i in range(8):
+            feat = "color" if i % 2 == 0 else "shape"
+            for w in self._stream(feat, 2, seed=seed):
+                h.run_world(w)
+            seed += 1
+        fast_h = _effective_hazard(h)
+        self.assertGreater(fast_h, slow_h + 0.01)
+
+    def test_solves_shape_after_color(self):
+        h = ObservationHazardAgent()
+        for w in self._stream("color", 5):
+            h.run_world(w)
+        r = h.run_world(self._stream("shape", 1, seed=7)[0])
+        self.assertEqual(r["held_out"], 100.0)
+        self.assertEqual(r["rule"][0], "shape")
+
+    def test_deterministic(self):
+        a, b = ObservationHazardAgent(), ObservationHazardAgent()
+        for w in self._stream("color", 4):
+            a.run_world(w)
+        for w in self._stream("color", 4):
+            b.run_world(w)
+        self.assertEqual(a.alpha, b.alpha)
+        self.assertEqual(a.hazard_logliks, b.hazard_logliks)
+
+    def test_rototest_006_deterministic(self):
+        r1 = rototest_006(seed=9, n_worlds=3, n_seeds=4)
+        r2 = rototest_006(seed=9, n_worlds=3, n_seeds=4)
+        self.assertEqual(r1["verdict"], r2["verdict"])
+        self.assertEqual(r1["gates"], r2["gates"])
+        self.assertEqual(r1["h_order_ci"], r2["h_order_ci"])
 
 
 if __name__ == "__main__":
