@@ -887,19 +887,23 @@ The Unknown World — Experiment 007 (the closed loop: a hazard that steers what
 - **The behavioral dividend is null (and the hedge is genuinely exercised).**
   A_dividend = −0.03, CI [−0.08, 0.02]: the hedged ACT is neither reliably
   better nor worse on fast worlds. This is not a dormant mechanism — the
-  instrumented trace shows `anticipate` diverges from `exact` on ~6 of 16
-  fast worlds, saving a step on most, losing once — but the *average* effect
-  is real-but-small. The 006 quiet readout survives the close-the-loop step:
-  a hazard that identifies cleanly still does not buy a reliable per-world
-  n_exp advantage in this geometry. n_exp is a coarse yardstick; a world takes
-  ~2–4 experiments and the hedge can only save a step when a 4-step world
-  becomes a 3-step world.
+  instrumented trace shows `anticipate` picks a different query than `exact`
+  on a subset of fast worlds (the first seven B-fast worlds and the first
+  three switchrate fast worlds never diverge — divergence appears only once
+  the hierarchy's hazard belief has shifted), and when they diverge the step
+  ledger tilts weakly toward saving (79 saves vs 66 losses across the 496
+  gate fast-world draws, of which 145 diverge) but nowhere near a reliable
+  dividend. The 006 quiet readout survives the
+  close-the-loop step: a hazard that identifies cleanly still does not buy a
+  reliable per-world n_exp advantage in this geometry. n_exp is a coarse
+  yardstick; a world takes ~2–4 experiments and the hedge can only save a
+  step when a 4-step world becomes a 3-step world.
 - **Behavior is inherited and safe.** Both new arms keep the full stationary
   benefit (A-transfer −0.34/−0.30), the calm tails at 2.50 vs null's 3.09,
   and both stay inside the mixed margin. B-switchrate is scored for all arms
-  against the same stream and shows the same ≈ −0.4 advantage for every
-  hazard-aware arm: the new block behaves, and behaving is now measured in a
-  block the 006 protocol could not see.
+  against the same stream and shows the same ≈ −0.3 to −0.4 advantage for
+  every hazard-aware arm: the new block behaves, and behaving is now measured
+  in a block the 006 protocol could not see.
 - **Calibration (not gated) is well-behaved and correctly rounded toward
   change.** On fast worlds, realized switches = 0.467 and the exact arm
   predicts 0.441 (Brier 0.289) against the grid's sleepy 0.228 (Brier 0.314).
@@ -910,11 +914,12 @@ The Unknown World — Experiment 007 (the closed loop: a hazard that steers what
   candidates pull the mean down. Neither is a disaster; both report the
   ordering (high on fast, low on slow) the gates demand.
 - **Stability across seed bases {5, 6, 7, 8, 9} at `n_seeds = 16:`**
-  verdict `inconclusive` at every base. The two failing gates each have one
-  adjacent wobble — A_dividend's CI upper crosses zero at base 7 (0.018) and
-  C_mixed's at base 8 (0.31, the same pre-existing world-draw fragility 002/003
-  diagnosed) — while H_order is stable in 5/5 (CI lower ≈ 0.365 everywhere).
-  A_transfer passes in 5/5. The verdict is not a fluke of seed base.
+  verdict `inconclusive` at every base. The failures are localized: H_fall
+  fails at *every* base (a stable negative, not a seed artifact);
+  A_dividend's CI upper crosses zero at base 7 only (0.018); C_mixed's at
+  base 8 only (0.31, the same pre-existing world-draw fragility 002/003
+  diagnosed) — while H_order is stable in 5/5 (CI lower ≈ 0.365 everywhere)
+  and A_transfer passes in 5/5. The verdict is not a fluke of seed base.
 - **Honesty constraints that shaped the design.** The five gates and the
   switchrate hyperparameters (widths, capture points `SR1_AT/SRFAST_AT/SRMID_AT`,
   `META_HAZARD = 1/50`, `(a_p, b_p) = (1, 1)`, run cap 24, `max_states = 384`)
@@ -943,10 +948,10 @@ much of the program's claims are delivered by mechanism versus measurement.
 | Exp | Claim | Evidence site | Outcome |
 | --- | --- | --- | --- |
 | 001 | ACT (version-space narrowing) adapts to a novel world | n_exp curve | **kept** — the competence-curve primitive works but is context-blind |
-| 002 | A salience prior biases ACT | stationary n_exp | **rejected** — fragile to world-draw composition; exposed rigidity |
+| 002 | A salience prior biases ACT | stationary n_exp | **inconclusive** (not kept) — fragile to world-draw composition; exposed rigidity |
 | 003 | Paired seeded rototest makes the measurement honest | re-run of 001/002 | **kept** (methodological) — the harness, verdicts computed by code |
 | 004 | A change-point prior that *learns* beats a blind prior after a switch | B-switch, A-transfer | **kept** — forgetting is measured, but hazard is hand-set |
-| 005 | The prior learns its own hazard (removing the hand-set rate) | winner-sequence hazard | **rejected** — hazard invisible in the 2-feature compressed stream |
+| 005 | The prior learns its own hazard (removing the hand-set rate) | winner-sequence hazard | **inconclusive** (not kept) — hazard invisible in the 2-feature compressed stream |
 | 006 | Per-observation updates restore hazard identification | E[h] trajectory | **kept** — identification recovered; behavioral dividend still quiet |
 | 007 | Grid-free three-level hazard + hazard-aware ACT closes the loop | H_order, H_fall, A_dividend | **inconclusive** — identification sharpens (0.367), loop steps fail |
 
@@ -982,7 +987,8 @@ ICML 2025):
   sampling × change-point detection (Yi & Yang, *Stat. Papers* 2026,
   arXiv:2512.15507); proactive drift adaptation (*Machine Learning* 2025);
   recurring concept drift (Suárez-Cetrulo et al. 2023); and a deliberate
-  honesty caveat — Huang, Zhang et al. (DeepMind, ICLR 2023) showed LLM
+  honesty caveat — Huang, Chen, Mishra et al. (Google DeepMind, ICLR 2024)
+  showed LLM
   self-correction without ground truth can *degrade* answers, so "self-model"
   claims here are limited to within-world beliefs measured against realized
   switches, never introspective text. Liu & van der Schaar (ICML 2025)
@@ -1002,8 +1008,9 @@ The 007 record leaves three concrete debts:
   gate that samples the recovery *trajectory* (e.g. the post-sr2 endpoint,
   or a fitted fall slope) rather than one too-early point is the natural
   008 measurement — pre-committed *before* running 008, per the discipline.
-- **Make the dividend measurable.** The hedge saves a step on 5 of 6
-  divergent worlds but n_exp's 2–4 granularity hides the average. A
+- **Make the dividend measurable.** On the ~145 divergent fast-world draws
+  the hedge saves a step 79 times and loses 66 (≈ 54/46), a real but
+  marginal edge that n_exp's 2–4 granularity hides in the average. A
   per-world cost that can move by fractional steps, or a longer switchrate
   fast phase, should let the hedge's direction either reach significance or
   be honestly retired.
