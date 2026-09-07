@@ -6,10 +6,53 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-brightgreen.svg"></a>
-  <a href="https://www.python.org/"><img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-blue.svg"></a>
-  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiment" src="https://img.shields.io/badge/latest%20experiment-007-orange.svg"></a>
+  <a href="https://www.python.org/"><img alt="Python 3.8–3.12" src="https://img.shields.io/badge/python-3.8%20%E2%80%94%203.12-blue.svg"></a>
+  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiments" src="https://img.shields.io/badge/experiments-001%E2%80%93007-orange.svg"></a>
   <a href="https://github.com/NullLabTests/unknown-world/actions/workflows/tests.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/NullLabTests/unknown-world/tests.yml?label=tests"></a>
-  <a href="https://github.com/NullLabTests/unknown-world"><img alt="Repo" src="https://img.shields.io/github/repo-size/NullLabTests/unknown-world.svg"></a>
+  <a href="https://github.com/NullLabTests/unknown-world"><img alt="Dependencies" src="https://img.shields.io/badge/dependencies-none-brightgreen.svg"></a>
+  <a href="https://github.com/NullLabTests/unknown-world"><img alt="Reproducible" src="https://img.shields.io/badge/reproducible-deterministic%20seeds-brightgreen.svg"></a>
+</p>
+
+## Executive summary
+
+> **Question.** What is the minimum set of mechanisms from which general
+> intelligence can emerge — and how do we *honestly* test that?
+>
+> **What was built.** Seven experiments on the smallest possible artificial
+> world (6 objects, 2 features, one hidden rule): an active learner that
+> narrows a version space, salience/biasing priors, a change-point hazard
+> monitor, and a closed-loop agent whose own hazard belief steers what it
+> asks next. Every run is paired-seed comparison, pre-committed gates whose
+> verdicts are computed by the harness (never hand-edited), a byte-verbatim
+> record of the run output, and cross-seed-base stability checks.
+>
+> **Honest outcome.** The measurement discipline is the deliverable: most
+> mechanisms were kept only where their effect was real (adaptation,
+> change-aware priors, per-observation hazard identification); the flagship
+> closed-loop hedge (007) was **inconclusive** and *not* kept. It reports
+> what it cannot show.
+>
+> **What was learned.** That a faithful experiment log — where results are
+> published before they are believed — is the thing most reproducibility
+> playbooks promise and few repos deliver. Run it yourself: `python3 run.py`
+> reproduces the latest report byte-for-byte.
+
+<p align="center">
+  <img src="charts/timeline.png" alt="Seven experiments, one measurement discipline: 001,003,004,006 kept; 002,005,007 inconclusive and not kept." width="95%">
+</p>
+
+## Quickstart
+
+```bash
+git clone git@github.com:NullLabTests/unknown-world.git && cd unknown-world
+python3 run.py                      # experiment 007 + verdict, byte-for-byte the README report
+python3 -m unittest discover -s .   # 61 sanity tests, stdlib only
+```
+
+Stdlib only, zero dependencies, deterministic (`random.Random(seed = 7)`).
+
+<p align="center">
+  <em>Every experiment is one command, every report is one verbatim block.</em>
 </p>
 
 ## The question
@@ -774,7 +817,8 @@ pre-committed, computed by the harness):
   should re-learn the calm rate faster than the grid's stiff cumulative
   likelihoods;
 - `A_dividend` — anticipate's n_exp on fast worlds (B-fast worlds 2..16 plus
-  switchrate fast worlds 34..48) falls below exact's (CI upper < 0): the
+  switchrate fast-phase worlds `SR1_AT+1 .. SRFAST_AT` = 34..49) falls below
+  exact's (CI upper < 0): the
   hazard-steered ACT must buy a measurable recovery;
 - `C_mixed_no_harm` — both new arms stay within the 0.25 mixed-margin.
 
@@ -856,6 +900,32 @@ The Unknown World — Experiment 007 (the closed loop: a hazard that steers what
   verdict: inconclusive
   Signals mixed (A_ok=True H_order=True H_fall=False A_dividend=False C_ok=True). The closed loop is not kept.
 ```
+
+Every number above is drawn from the byte-verified record; the figures below are
+rendered from the same data by `tools/make_figures.py` (dev-only dependency:
+matplotlib — the repo itself remains stdlib-only).
+
+**The record, drawn**
+
+<p align="center">
+  <em>Per-block advantage (n_exp arm − n_exp null); every arm beats null on nearly every block.</em><br>
+  <img src="charts/hero_advantage.png" alt="Per-block n_exp advantage of grid/exact/anticipate vs null, all arms negative on nearly every block." width="95%">
+</p>
+
+<p align="center">
+  <em>Effective hazard E[h] across capture points: the hierarchy spikes decisively on fast and re-converges toward calm.</em><br>
+  <img src="charts/hazard_trajectory.png" alt="Line plot of effective hazard over capture points: exact spikes to 0.63 on fast, grid peaks at 0.32." width="95%">
+</p>
+
+<p align="center">
+  <em>The five pre-committed gates on their 95% CIs — H_fall and A_dividend cross their boundaries.</em><br>
+  <img src="charts/gates.png" alt="Gate forest plot: green passed gates, red failed gates, dotted boundary lines." width="95%">
+</p>
+
+<p align="center">
+  <em>Calibration (reported, not gated): boundary-start belief vs realized switches, per pace.</em><br>
+  <img src="charts/calibration.png" alt="Predicted vs realized switch rate per pace for grid, exact, anticipate." width="95%">
+</p>
 
 **Measurement notes**
 
@@ -1051,6 +1121,7 @@ Stdlib only. No dependencies. Deterministic seed (`random.Random(7)`).
 | `protocol.py` | paired seeded harness (003), four-arm change-aware / regime-stream harnesses (004–007): exact permutation p, bootstrap CI, Cohen's `dz`, hazard-identification and switchrate gates, calibration readout, harness verdicts |
 | `run.py` | runs Experiment 007 by default; `run.py 006` / `005` / `004` / `003` / `002` reproduce the earlier evidence |
 | `test_step1.py` | sanity suite (61 tests: world, salience, protocol, statistics, paired v2, change-aware, hierarchy, observation-hazard, latent-hazard, latent-hazard-anticipate) |
+| `tools/make_figures.py` | renders the README figures from the byte-verified report data (`charts/*.png`) |
 
 ## License
 
