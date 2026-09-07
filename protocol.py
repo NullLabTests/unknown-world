@@ -14,9 +14,11 @@ import statistics
 
 from agent import (
     Agent,
-    ForgetAgent,
     ChangePointAgent,
+    ForgetAgent,
     HierarchicalChangePointAgent,
+    LatentHazardAgent,
+    LatentHazardAnticipateAgent,
     ObservationHazardAgent,
 )
 from world import UnknownWorld
@@ -1045,6 +1047,8 @@ def _rototest_006_arms(seed, n_worlds, n_seeds):
 
 def _effective_hazard(agent):
     """Posterior-mean hazard E[h] of a hazard-learning agent."""
+    if hasattr(agent, "effective_hazard"):
+        return agent.effective_hazard()
     hps = agent.hazard_posterior()
     return sum(w * h for w, h in zip(hps, agent.hazards))
 
@@ -1198,6 +1202,401 @@ def print_006_report(result):
         % (m, lo, hi, result["h_margin"])
     )
     print("-" * 82)
+    for gate, ok in result["gates"].items():
+        print("  %-26s : %s" % (gate.upper(), ok))
+    print("  verdict: %s" % result["verdict"])
+    print("  %s" % result["why"])
+
+
+# ---------------------------------------------------------------------------
+# Experiment 007: the exact latent-hazard hierarchy + hazard-aware ACT
+# ---------------------------------------------------------------------------
+
+ARMS_007 = ("null", "grid", "exact", "anticipate")
+SWITCHRATE_WIDTHS = (16, 16, 2, 2, 2, 2, 2, 2, 2, 2, 16, 16)
+SWITCHRATE_START = "shape"  # calm entry: continues the B-fast block's final feature
+BLOCKS_007 = (
+    "A-learn",
+    "A-transfer",
+    "B-home",
+    "B-slow",
+    "B-fast",
+    "B-switchrate",
+    "C-mixed",
+)
+# world positions inside the 88-world B-switchrate block
+# phase-1 calm  worlds 1..32   (rho=16)   post-sr1  = boundary 32->33
+# fast phase    worlds 33..48  (rho=2)    post-srfast = boundary 48->49
+# phase-2 calm  worlds 49..80  (rho=16)   post-srmid = boundary 59->60
+SR1_AT = 33
+SRFAST_AT = 49
+SRMID_AT = 60
+
+
+def _arm_factory_007(arm):
+    if arm == "grid":
+        return lambda: ObservationHazardAgent()
+    if arm == "exact":
+        return lambda: LatentHazardAgent()
+    if arm == "anticipate":
+        return lambda: LatentHazardAnticipateAgent()
+    return Agent
+
+
+def _rototest_007_arms(seed, n_worlds, n_seeds):
+    """Per-arm steps, B-position lists, hazard captures, and calibration reads."""
+    block_len = {"A-learn": n_worlds, "A-transfer": n_worlds, "C-mixed": N_MIXED}
+    for p in PACES:
+        block_len["B-" + p] = _pace_length(p)
+    block_len["B-switchrate"] = sum(SWITCHRATE_WIDTHS)
+
+    per_arm = {a: {b: [] for b in BLOCKS_007} for a in ARMS_007}
+    b_pos = {
+        a: {p: {t: [] for t in range(1, block_len["B-" + p] + 1)} for p in ("home", "slow", "fast", "switchrate")}
+        for a in ARMS_007
+    }
+    hazard_seeds = {
+        a: [] for a in ("grid", "exact", "anticipate")
+    }
+    sr_hazard = {
+        a: {k: [] for k in ("post-sr1", "post-srfast", "post-srmid", "post-sr2")}
+        for a in ("grid", "exact", "anticipate")
+    }
+    calibration = {
+        a: {p: [] for p in ("home", "slow", "fast", "switchrate")} for a in ARMS_007
+    }
+    slow_tail = {a: [] for a in ARMS_007}
+
+    order = ("A-learn", "A-transfer", "B-home", "B-slow", "B-fast", "B-switchrate", "C-mixed")
+
+    for s in range(n_seeds):
+        srng = random.Random(seed * 10000 + s)
+        segs = {
+            "A-learn": [UnknownWorld.generate(srng, force_feature="color") for _ in range(n_worlds)],
+            "A-transfer": [UnknownWorld.generate(srng, force_feature="color") for _ in range(n_worlds)],
+            "B-home": _regime_worlds(srng, REGIME_WIDTHS["home"], PACES_START["home"]),
+            "B-slow": _regime_worlds(srng, REGIME_WIDTHS["slow"], PACES_START["slow"]),
+            "B-fast": _regime_worlds(srng, REGIME_WIDTHS["fast"], PACES_START["fast"]),
+            "B-switchrate": _regime_worlds(srng, SWITCHRATE_WIDTHS, SWITCHRATE_START),
+            "C-mixed": [UnknownWorld.generate(srng) for _ in range(N_MIXED)],
+        }
+
+        for arm in ARMS_007:
+            factory = _arm_factory_007(arm)
+            if arm == "null":
+                agent = factory()
+                runs = {b: run_null_sequence(agent, segs[b]) for b in order}
+            else:
+                agent = factory()
+                hazard_seeds[arm].append({})
+                prior_blocks = ("A-learn", "A-transfer", "B-home", "B-slow", "B-fast", "B-switchrate")
+                runs = {}
+                for b in prior_blocks:
+                    worlds = segs[b]
+                    runs[b] = []
+                    for i, w in enumerate(worlds, start=1):
+                        # boundary-start hazard belief; reading it mutates nothing.
+                        pc = _effective_hazard(agent)
+                        if b.startswith("B-") and i >= 2:
+                            prev = worlds[i - 2]
+                            calibration[arm][b[2:]].append(
+                                (pc, w.hidden_rule[0] != prev.hidden_rule[0])
+                            )
+                        if b == "B-switchrate" and arm in sr_hazard:
+                            if i == SR1_AT:
+                                sr_hazard[arm]["post-sr1"].append(pc)
+                            elif i == SRFAST_AT:
+                                sr_hazard[arm]["post-srfast"].append(pc)
+                            elif i == SRMID_AT:
+                                sr_hazard[arm]["post-srmid"].append(pc)
+                        runs[b].append(agent.run_world(w))
+                    if b == "B-switchrate" and arm in sr_hazard:
+                        sr_hazard[arm]["post-sr2"].append(_effective_hazard(agent))
+                    if arm in hazard_seeds:
+                        key = {
+                            "A-transfer": "post-A",
+                            "B-home": "post-home",
+                            "B-slow": "post-slow",
+                            "B-fast": "post-fast",
+                        }.get(b)
+                        if key is not None:
+                            hazard_seeds[arm][-1][key] = _effective_hazard(agent)
+                fresh = factory()
+                runs["C-mixed"] = run_prior_sequence(fresh, segs["C-mixed"])
+
+            for b in order:
+                res_list = runs[b]
+                per_arm[arm][b].extend(r["steps"] for r in res_list)
+                if b.startswith("B-"):
+                    pace = b[2:]
+                    for t, r in enumerate(res_list, start=1):
+                        b_pos[arm][pace][t].append(r["steps"])
+                if b == "B-slow":
+                    for t, r in enumerate(res_list, start=1):
+                        if (t - 1) % REGIME_WIDTHS["slow"][0] + 1 >= 9:
+                            slow_tail[arm].append(r["steps"])
+
+    return per_arm, b_pos, hazard_seeds, sr_hazard, calibration, slow_tail
+
+
+def rototest_007(seed=7, n_worlds=5, n_seeds=16, h_margin=H_MARGIN):
+    """The closed loop: does a learned hazard that also steers ACT pay?
+
+    Arms run the exact same world streams:
+    - `null`       identical machinery, no prior (base Agent, reset each world);
+    - `grid`       Experiment 006's per-observation hazard learner (grid hazard);
+    - `exact`      Wilson et al.'s latent-hazard hierarchy (no grid at all);
+    - `anticipate` `exact` + hazard-aware ACT (query value hedged by the
+                   agent's own boundary-change belief).
+
+    The stream is the 006 protocol (calm entry at every block boundary) plus
+    the new B-switchrate block: 32 calm worlds (rho=16), 16 fast worlds
+    (rho=2), 32 calm worlds — the stream's *rate of change changes*, the one
+    thing a constant-hazard monitor cannot express.
+
+    Pre-committed gates, computed by the harness:
+    - A_transfer_no_regression: exact AND anticipate are not worse than null
+      on the stationary A-transfer benefit (paired CI upper < 0).
+    - H_order_retained: the exact hierarchy also orders fast over slow after
+      the 006 blocks (per-seed E[h|fast] - E[h|slow], CI lower > H_MARGIN).
+    - H_fall_recovers: when the fast phase ends and calm returns, the exact
+      hierarchy re-learns the calm rate faster than the grid (per-seed paired
+      exact - grid on E[h] twelve worlds into phase-2 calm, CI upper < 0).
+      This is the hierarchy's signature: it detects the meta change-point and
+      resets its Beta counts, where the grid must damp its whole accumulated
+      likelihood.
+    - A_dividend: hazard-aware ACT beats the exact hierarchy's plain ACT on
+      fast worlds (B-fast worlds 2..16 + switchrate fast worlds, paired CI
+      upper < 0). The behavioral dividend 006 listed as the open question.
+    - C_mixed_no_harm: exact AND anticipate within the mixed non-inferiority
+      margin against null.
+
+    Calibration (reported, not gated): each hazard arm's boundary-start belief
+    E[h~] against the realized next-world feature switches (Brier score) — the
+    self-knowledge readout: is the agent's stated rate of its own change true?
+    """
+    per_arm, b_pos, hazard_seeds, sr_hazard, calibration, slow_tail = _rototest_007_arms(
+        seed, n_worlds, n_seeds
+    )
+
+    saw = {b: len(per_arm["exact"][b]) // n_seeds for b in BLOCKS_007}
+
+    def pair(arm, b):
+        return _pair_blocks(per_arm[arm][b], per_arm["null"][b])
+
+    stats = {}
+    for arm in ("grid", "exact", "anticipate"):
+        stats[arm] = {}
+        for i, b in enumerate(BLOCKS_007):
+            ds = pair(arm, b)
+            per_seed = []
+            wpt = saw[b]
+            for s in range(n_seeds):
+                chunk = ds[s * wpt : (s + 1) * wpt]
+                per_seed.append(sum(chunk) / len(chunk))
+            stats[arm][b] = _block_stats(arm + ":" + b, i, ds, per_seed, seed)
+
+    # -- inherited identification gate: does the exact hierarchy order rates? --
+    h_eff = {
+        arm: {
+            k: [d[k] for d in hazard_seeds[arm] if k in d]
+            for k in ("post-A", "post-home", "post-slow", "post-fast")
+        }
+        for arm in hazard_seeds
+    }
+    h_order_ds = [f - s for f, s in zip(h_eff["exact"]["post-fast"], h_eff["exact"]["post-slow"])]
+    h_order_ci = bootstrap_ci(h_order_ds, _resample_seed(seed, 221))
+
+    # -- hierarchy signature: recovery after the rate changes back to calm --
+    fall_ds = [e - g for e, g in zip(sr_hazard["exact"]["post-srmid"], sr_hazard["grid"]["post-srmid"])]
+    fall_ci = bootstrap_ci(fall_ds, _resample_seed(seed, 222))
+
+    # -- hazard-aware ACT dividend on fast worlds --
+    dividend_ds = []
+    for t in range(2, saw["B-fast"] + 1):
+        dividend_ds.extend(
+            x - y for x, y in zip(b_pos["anticipate"]["fast"][t], b_pos["exact"]["fast"][t])
+        )
+    for t in range(SR1_AT + 1, SRFAST_AT + 1):
+        dividend_ds.extend(
+            b_pos["anticipate"]["switchrate"][t][j] - b_pos["exact"]["switchrate"][t][j]
+            for j in range(n_seeds)
+        )
+    dividend_ci = bootstrap_ci(dividend_ds, _resample_seed(seed, 223))
+
+    # -- inherited benefit / safety gates for both new arms --
+    a_exact = bootstrap_ci(pair("exact", "A-transfer"), _resample_seed(seed, 224))
+    a_anticipate = bootstrap_ci(pair("anticipate", "A-transfer"), _resample_seed(seed, 225))
+    c_exact = bootstrap_ci(pair("exact", "C-mixed"), _resample_seed(seed, 226))
+    c_anticipate = bootstrap_ci(pair("anticipate", "C-mixed"), _resample_seed(seed, 227))
+
+    a_ok = a_exact[1] < 0.0 and a_anticipate[1] < 0.0
+    h_ok = h_order_ci[0] > h_margin
+    fall_ok = fall_ci[1] < 0.0
+    div_ok = dividend_ci[1] < 0.0
+    c_ok = c_exact[1] < C_MARGIN and c_anticipate[1] < C_MARGIN
+
+    gates = {
+        "A_transfer_no_regression": a_ok,
+        "H_order_retained": h_ok,
+        "H_fall_recovers": fall_ok,
+        "A_dividend": div_ok,
+        "C_mixed_no_harm": c_ok,
+    }
+
+    if all(gates.values()):
+        verdict = "kept"
+        why = (
+            "The exact latent-hazard hierarchy sheds the grid without losing "
+            "the transfer benefit or the fast>slow ordering, re-learns the calm "
+            "rate faster than the grid when the stream's rate of change falls, "
+            "and the hazard-aware ACT reliably cuts n_exp on fast worlds while "
+            "both remain harmless on mixed worlds. The loop is closed: a prior "
+            "that learns its own rate of forgetting also steers what it asks. "
+            "Keep the closed loop."
+        )
+    elif not a_ok:
+        verdict = "rejected"
+        why = (
+            "The exact hierarchy lost the transfer benefit over the identical-"
+            "machinery control: the upgrade broke the prior."
+        )
+    else:
+        verdict = "inconclusive"
+        why = (
+            "Signals mixed (A_ok=%s H_order=%s H_fall=%s A_dividend=%s "
+            "C_ok=%s). The closed loop is not kept."
+            % (a_ok, h_ok, fall_ok, div_ok, c_ok)
+        )
+
+    return {
+        "stats": stats,
+        "hazard_eff": h_eff,
+        "h_order_ds": h_order_ds,
+        "h_order_ci": h_order_ci,
+        "fall_ds": fall_ds,
+        "fall_ci": fall_ci,
+        "dividend_ds": dividend_ds,
+        "dividend_ci": dividend_ci,
+        "sr_hazard": sr_hazard,
+        "calibration": calibration,
+        "slow_tail_steps": slow_tail,
+        "saw": saw,
+        "a_exact": a_exact,
+        "a_anticipate": a_anticipate,
+        "c_exact": c_exact,
+        "c_anticipate": c_anticipate,
+        "b_pos": b_pos,
+        "gates": gates,
+        "verdict": verdict,
+        "why": why,
+        "n_seeds": n_seeds,
+        "n_worlds": n_worlds,
+        "seed_base": seed,
+    }
+
+
+def print_007_report(result):
+    saw = result["saw"]
+    print("  per-arm vs null (identical worlds; d = n_exp(arm) - n_exp(null))")
+    print(
+        "  block         arm         n    mean d  95% CI            p(prior<null)  dz     seeds helping"
+    )
+    print("-" * 94)
+    for b in BLOCKS_007:
+        for arm in ("grid", "exact", "anticipate"):
+            s = result["stats"][arm][b]
+            dz = "  n/a" if s["dz"] is None else "%5.2f" % s["dz"]
+            print(
+                "  %-12s  %-10s %4d  %6.2f  [%6.2f, %6.2f]   %s     %s   %d/%d"
+                % (
+                    b,
+                    arm,
+                    s["n"],
+                    s["mean"],
+                    s["ci95"][0],
+                    s["ci95"][1],
+                    "%.4f" % s["p_less"],
+                    dz,
+                    s["seeds_help"],
+                    result["n_seeds"],
+                )
+            )
+    print("-" * 94)
+
+    print("  effective hazard E[h] (posterior mean over seeds) by capture point")
+    print("        %-8s %-8s %-8s %-8s %-8s %-8s %-8s" % (
+        "post-A", "post-home", "post-slow", "post-fast", "post-sr1", "post-srfast", "post-srmid"))
+    for arm in ("grid", "exact", "anticipate"):
+        row = []
+        for k in ("post-A", "post-home", "post-slow", "post-fast"):
+            vals = result["hazard_eff"][arm].get(k, [])
+            row.append(sum(vals) / len(vals) if vals else float("nan"))
+        for k in ("post-sr1", "post-srfast", "post-srmid"):
+            vals = result["sr_hazard"][arm].get(k, [])
+            row.append(sum(vals) / len(vals) if vals else float("nan"))
+        print("    %-10s " % arm + "  ".join("%8.4f" % x for x in row))
+    print("  post-sr2 (end of the second calm phase):")
+    for arm in ("grid", "exact", "anticipate"):
+        vals = result["sr_hazard"][arm]["post-sr2"]
+        print("    %-10s %8.4f" % (arm, sum(vals) / len(vals) if vals else float("nan")))
+    print("-" * 94)
+
+    print("  gate CIs (the verdict is drawn on these boundaries)")
+    lo, hi, m = result["a_exact"]
+    print("    A_transfer  exact-null       mean d %6.2f  95%% CI [%6.2f, %6.2f]   (upper<0)" % (m, lo, hi))
+    lo, hi, m = result["a_anticipate"]
+    print("    A_transfer  anticipate-null  mean d %6.2f  95%% CI [%6.2f, %6.2f]   (upper<0)" % (m, lo, hi))
+    lo, hi, m = result["h_order_ci"]
+    print(
+        "    H_order     exact post-fast - post-slow  mean %6.3f  95%% CI [%6.3f, %6.3f]  (lower>%4.2f)"
+        % (m, lo, hi, H_MARGIN)
+    )
+    lo, hi, m = result["fall_ci"]
+    print(
+        "    H_fall      exact - grid, E[h] at mid second calm  mean %6.3f  95%% CI [%6.3f, %6.3f]  (upper<0)"
+        % (m, lo, hi)
+    )
+    lo, hi, m = result["dividend_ci"]
+    print(
+        "    A_dividend  anticipate - exact on fast worlds  mean d %6.2f  95%% CI [%6.2f, %6.2f]  (upper<0)"
+        % (m, lo, hi)
+    )
+    lo, hi, m = result["c_exact"]
+    print("    C_mixed     exact-null       mean d %6.2f  95%% CI [%6.2f, %6.2f]   (upper<0.25)" % (m, lo, hi))
+    lo, hi, m = result["c_anticipate"]
+    print("    C_mixed     anticipate-null  mean d %6.2f  95%% CI [%6.2f, %6.2f]   (upper<0.25)" % (m, lo, hi))
+    print("-" * 94)
+
+    st = result["slow_tail_steps"]
+    print(
+        "  mean n_exp per arm on the B-slow calm tails: grid %.2f  exact %.2f  anticipate %.2f  null %.2f"
+        % (
+            sum(st["grid"]) / len(st["grid"]),
+            sum(st["exact"]) / len(st["exact"]),
+            sum(st["anticipate"]) / len(st["anticipate"]),
+            sum(st["null"]) / len(st["null"]),
+        )
+    )
+    print("-" * 94)
+
+    print("  calibration readout (reported, not gated): boundary-start belief vs realized switches")
+    print("    arm         pace        n   mean pred  realized   brier")
+    for arm in ("grid", "exact", "anticipate"):
+        for pace in ("home", "slow", "fast", "switchrate"):
+            pairs = result["calibration"][arm][pace]
+            if not pairs:
+                continue
+            preds = [p for p, _ in pairs]
+            acts = [a for _, a in pairs]
+            mp = sum(preds) / len(preds)
+            ma = sum(acts) / len(acts)
+            brier = sum((p - a) ** 2 for p, a in pairs) / len(pairs)
+            print(
+                "    %-10s  %-10s %5d   %7.3f   %7.3f   %7.4f"
+                % (arm, pace, len(pairs), mp, ma, brier)
+            )
+    print("-" * 94)
     for gate, ok in result["gates"].items():
         print("  %-26s : %s" % (gate.upper(), ok))
     print("  verdict: %s" % result["verdict"])

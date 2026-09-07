@@ -319,6 +319,10 @@ class HierarchicalChangePointAgent(Agent):
         total = sum(weights) or 1.0
         return [w / total for w in weights]
 
+    def effective_hazard(self):
+        hps = self.hazard_posterior()
+        return sum(w * h for w, h in zip(hps, self.hazards))
+
     def _expected_counts_trellis(self, runs):
         total = sum(p for _, p, _ in runs) or 1.0
         out = {f: 0.0 for f in self.features}
@@ -459,12 +463,17 @@ class ObservationHazardAgent(Agent):
             f: {v: 1.0 for v in FEATURE_DOMAINS[f]} for f in self.features
         }
         self._boundary_pending = True
+        self._world_p_change = self.effective_hazard()
 
     def hazard_posterior(self):
         peak = max(self.hazard_logliks)
         weights = [math.exp(x - peak) for x in self.hazard_logliks]
         total = sum(weights) or 1.0
         return [w / total for w in weights]
+
+    def effective_hazard(self):
+        hps = self.hazard_posterior()
+        return sum(w * h for w, h in zip(hps, self.hazards))
 
     def _feature_predictive(self, obj, opened):
         """Per-feature likelihood of this observation given value evidence.
@@ -544,3 +553,272 @@ class ObservationHazardAgent(Agent):
                 for f in self.features:
                     out[f] += w * (p / total) * c[f]
         self.alpha = out
+
+
+# ---------------------------------------------------------------------------
+# Experiment 007: the exact latent-hazard hierarchy + hazard-aware ACT
+# ---------------------------------------------------------------------------
+
+# Pre-committed 007 hyperparameters (set before any measurement, not tuned):
+META_HAZARD = 1.0 / 50.0  # Wilson et al. h^(0): rate the hazard itself changes
+HAZARD_AP = 1.0           # Beta prior params on the hazard (uniform)
+HAZARD_BP = 1.0
+
+
+class LatentHazardAgent(Agent):
+    """Exact three-level latent-hazard hierarchy (Wilson, Nassar & Gold 2010).
+
+    The hazard grid of Experiments 005/006 is removed entirely. The hazard
+    rate is a latent Beta-Bernoulli variable carried inside the hierarchy,
+    exactly as in Wilson et al. equations (16)-(24): each node holds four
+    sufficient statistics ``(r2, a, b, c)``:
+
+    - ``r2``  the data-level run length (observations since the current
+      feature regime began),
+    - ``a``   the change-point count of the Beta posterior on the hazard,
+    - ``b``   the non-change-point count of the Beta posterior on the hazard,
+    - ``c``   a Dirichlet belief over which feature governs the current run.
+
+    The high-level run length is ``r1 = a + b`` (eqn 42), and the node's
+    hazard estimate is ``h~ = (a + a_p) / (a + b + a_p + b_p)`` (eqn 43) with
+    the pre-committed Beta prior ``(a_p, b_p) = (HAZARD_AP, HAZARD_BP)``.
+
+    Every observation a node spawns four children (eqn 24), weighted by
+    ``(1-h0)(1-h~)``, ``(1-h0)h~``, ``h0(1-h~)``, ``h0 h~`` where
+    ``h0 = META_HAZARD`` is the rate at which the hazard *itself* changes:
+
+    - no hazard change, data grows:        ``r2+1, a, b+1, c . lik``
+    - no hazard change, data changes:      ``0, a+1, b, fresh``
+    - hazard change, data grows:           ``r2+1, a_p, b_p, c . lik``
+    - hazard change, data changes:         ``0, a_p, b_p, fresh``
+
+    The two data-change children reset the run (``r2 -> 0``, feature counts
+    back to the uniform base) and are gated to the first observation of each
+    world, exactly as in Experiment 006 (a feature cannot change inside a
+    world). The two hazard-change children reset the Beta counts to the prior:
+    that is the hierarchy's mechanism for *forgetting a dead hazard rate* and
+    re-learning from scratch — the property a non-constant rate requires.
+
+    The feature emission is Experiment 006's: the within-world value belief's
+    posterior predictive of the observed outcome per feature, so the whole
+    per-observation stream moves the hazard posterior. Salience for ACT still
+    updates only at convergence (identical-machinery discipline).
+
+    Pruning is Wilson et al. section 5's similarity grouping: nodes are
+    merged whose low-level run-length (``log(r2 + v_p)``), high-level
+    run-length (``log(r1 + a_p + b_p)``) and hazard estimate (``h~``) fall in
+    the same bin, then a hard ``max_states`` cap.
+    """
+
+    def __init__(
+        self,
+        features=None,
+        meta_hazard=META_HAZARD,
+        ap=HAZARD_AP,
+        bp=HAZARD_BP,
+        run_cap=24,
+        max_states=384,
+        k1=0.2,
+        k2=1.0,
+        vp=1.0,
+    ):
+        super().__init__(features)
+        self.meta_hazard = float(meta_hazard)
+        self.ap = float(ap)
+        self.bp = float(bp)
+        self.run_cap = run_cap
+        self.max_states = max_states
+        self.k1 = float(k1)
+        self.k2 = float(k2)
+        self.vp = float(vp)
+        self.nodes = None
+        self.value_weights = None
+        self._boundary_pending = False
+        self._world_p_change = 0.5
+        self.reset_salience()
+
+    def reset_salience(self):
+        super().reset_salience()
+        self.nodes = [(0, self.ap, self.bp, {f: 1.0 for f in self.features}, 1.0)]
+        self.value_weights = {
+            f: {v: 1.0 for v in FEATURE_DOMAINS[f]} for f in self.features
+        }
+        self._boundary_pending = True
+
+    def begin_world(self, world):
+        super().begin_world(world)
+        self.value_weights = {
+            f: {v: 1.0 for v in FEATURE_DOMAINS[f]} for f in self.features
+        }
+        self._boundary_pending = True
+        self._world_p_change = self.effective_hazard()
+
+    def effective_hazard(self):
+        """Posterior-mean hazard E[h~] over the hierarchy's nodes (eqn 43)."""
+        total = sum(p for *_, p in self.nodes) or 1.0
+        out = 0.0
+        for _, a, b, _, p in self.nodes:
+            out += (p / total) * (a + self.ap) / (a + b + self.ap + self.bp)
+        return out
+
+    def _feature_predictive(self, obj, opened):
+        out = {}
+        for f in self.features:
+            w = self.value_weights[f]
+            total = sum(w.values())
+            if total <= 0:
+                out[f] = 0.5
+                continue
+            p_open = sum(w[v] for v in w if getattr(obj, f) == v) / total
+            out[f] = p_open if opened else (1.0 - p_open)
+        return out
+
+    def observe(self, obj, opened):
+        super().observe(obj, opened)
+        lik = self._feature_predictive(obj, opened)
+        boundary = self._boundary_pending
+        self._boundary_pending = False
+
+        fresh = {f: 1.0 for f in self.features}
+        new = []
+        for r, a, b, c, p in self.nodes:
+            tot = sum(c.values())
+            if tot <= 0:
+                continue
+            em = sum((c[f] / tot) * lik[f] for f in self.features)
+            cfeat = {f: c[f] * lik[f] for f in self.features}
+            if not boundary:
+                # Within a world the hidden feature cannot change, so the
+                # observation is pure data-level growth: the hazard posterior
+                # (a Bernoulli trial over world boundaries) is untouched, while
+                # the data run extends and the feature belief updates.
+                new.append((min(r + 1, self.run_cap), a, b, cfeat, p * em))
+                continue
+            # One hazard event per world boundary (eqn 24): the two data-change
+            # children reset the run, the two hazard-change children reset the
+            # Beta counts to the prior, h0 = META_HAZARD scales the branches in
+            # which the hazard itself changed.
+            tilde_h = (a + self.ap) / (a + b + self.ap + self.bp)
+            g = min(r + 1, self.run_cap)
+            # no hazard change, data grows        (eqn 24 case 1)
+            new.append((g, a, b + 1.0, cfeat, p * (1.0 - tilde_h) * (1.0 - self.meta_hazard) * em))
+            # no hazard change, data changes      (eqn 24 case 2)
+            new.append((0, a + 1.0, b, dict(fresh), p * tilde_h * (1.0 - self.meta_hazard) * em))
+            # hazard change, data grows           (eqn 24 case 3)
+            new.append((g, self.ap, self.bp, cfeat, p * (1.0 - tilde_h) * self.meta_hazard * em))
+            # hazard change, data changes         (eqn 24 case 4)
+            new.append((0, self.ap, self.bp, dict(fresh), p * tilde_h * self.meta_hazard * em))
+
+        merged = {}
+        for r, a, b, c, p in new:
+            r1 = a + b
+            tilde_h = (a + self.ap) / (r1 + self.ap + self.bp)
+            key = (
+                int(math.log((r + self.vp) / self.vp) / math.log(1.0 + self.k2)),
+                int(math.log((r1 + self.ap + self.bp) / (self.ap + self.bp)) / math.log(1.0 + self.k1)),
+                int(tilde_h / self.k1),
+            )
+            slot = merged.get(key)
+            if slot is None:
+                slot = [0.0, 0.0, 0.0, 0.0, {f: 0.0 for f in self.features}]
+                merged[key] = slot
+            slot[0] += p
+            slot[1] += p * r
+            slot[2] += p * a
+            slot[3] += p * b
+            for f in c:
+                slot[4][f] += p * c[f]
+
+        nodes = []
+        for wp, wr, wa, wb, wc in merged.values():
+            tp = wp or 1.0
+            nodes.append(
+                (wr / tp, wa / tp, wb / tp, {f: wc[f] / tp for f in self.features}, wp)
+            )
+        nodes.sort(key=lambda s: -s[4])
+        if len(nodes) > self.max_states:
+            nodes = nodes[: self.max_states]
+        total_p = sum(p for *_, p in nodes) or 1.0
+        self.nodes = [(r, a, b, c, p / total_p) for r, a, b, c, p in nodes]
+
+        matched = {f: getattr(obj, f) for f in self.features}
+        for f in self.features:
+            w = self.value_weights[f]
+            for v in w:
+                if (v == matched[f]) != opened:
+                    w[v] = 0.0
+
+    def note_convergence(self):
+        rule = self.surviving_rule()
+        if rule is None:
+            return
+        total = sum(p for *_, p in self.nodes) or 1.0
+        out = {f: 0.0 for f in self.features}
+        for _, _, _, c, p in self.nodes:
+            for f in self.features:
+                out[f] += (p / total) * c[f]
+        self.alpha = out
+
+
+class LatentHazardAnticipateAgent(LatentHazardAgent):
+    """Hazard-aware ACT (Experiment 007): query value hedged under change.
+
+    The information gain of every candidate query is computed twice: once
+    under the current run's feature belief (standard weighted IG) and once
+    under a fresh world's belief (the hierarchy's change-branch predictive:
+    uniform feature counts). The value of the query is the mixture
+
+        IG = (1 - w) * IG_salience + w * IG_fresh,
+
+    blended by ``w`` = the agent's own hazard estimate at the world boundary:
+    its belief that the rule of the world it is about to touch is *not* the
+    current run's feature. Asking what matters if the world just changed is
+    the proactive case: when the learned rate of change is high, the agent
+    values queries that would pay off under either hypothesis of the
+    generative feature. At ``w = 0`` (a belief of no change) the hedged
+    query value reduces exactly to the standard ACT, so the paired
+    identical-machinery control stays valid.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._hedge_w = 0.0
+
+    def begin_world(self, world):
+        super().begin_world(world)
+        self._hedge_w = self._world_p_change
+
+    def _ig_from_masses(self, on_mass, off_mass, on_n, off_n):
+        n = len(self.hypotheses)
+        prior = math.log2(n) if n > 1 else 0.0
+
+        def term(mass, count):
+            if mass <= 0.0 or count <= 0:
+                return 0.0
+            if count == 1:
+                return 0.0
+            return mass * math.log2(count)
+
+        return prior - (term(on_mass, on_n) + term(off_mass, off_n))
+
+    def _weighted_ig(self, obj):
+        w = getattr(self, "_hedge_w", 0.0)
+        if w <= 0.0:
+            return super()._weighted_ig(obj)
+
+        masses = self._normalized_masses()
+        on_mass = 0.0
+        off_mass = 0.0
+        on_n = 0
+        off_n = 0
+        for h, p in zip(self.hypotheses, masses):
+            if predicts_open(h, obj):
+                on_mass += p
+                on_n += 1
+            else:
+                off_mass += p
+                off_n += 1
+        n = len(self.hypotheses)
+        ig_sal = self._ig_from_masses(on_mass, off_mass, on_n, off_n)
+        ig_fresh = self._ig_from_masses(on_n / n, off_n / n, on_n, off_n)
+        return (1.0 - w) * ig_sal + w * ig_fresh

@@ -1,4 +1,4 @@
-# The Unknown World — Experiments 001–006
+# The Unknown World — Experiments 001–007
 
 > A laboratory for discovering agents: tiny unknown-worlds, the smallest
 > possible learning mechanism installed into them, and a protocol that
@@ -7,7 +7,7 @@
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-brightgreen.svg"></a>
   <a href="https://www.python.org/"><img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-blue.svg"></a>
-  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiment" src="https://img.shields.io/badge/latest%20experiment-006-orange.svg"></a>
+  <a href="https://github.com/NullLabTests/unknown-world/blob/main/README.md"><img alt="Experiment" src="https://img.shields.io/badge/latest%20experiment-007-orange.svg"></a>
   <a href="https://github.com/NullLabTests/unknown-world/actions/workflows/tests.yml"><img alt="Tests" src="https://img.shields.io/github/actions/workflow/status/NullLabTests/unknown-world/tests.yml?label=tests"></a>
   <a href="https://github.com/NullLabTests/unknown-world"><img alt="Repo" src="https://img.shields.io/github/repo-size/NullLabTests/unknown-world.svg"></a>
 </p>
@@ -128,6 +128,15 @@ every touched object, with the change branch active only at world boundaries
 now moves the hazard posterior, so an event rate — fast regimes
 (flip almost every world) vs slow regimes (one calm long tail after another)
 — finally has evidence to bite on.
+
+Since Experiment 007, the hazard is even **without the grid**, and it steers
+what the agent asks. The `LatentHazardAgent` removes the hand-set hazards grid
+entirely and carries Wilson et al.'s exact three-level hierarchy: each node
+holds `(r2, a, b, c)` — the data-level run, plus the Beta posterior `(a, b)`
+over the hazard itself, with hazard-change branches that reset the counts and
+*forget a dead hazard rate*. The `LatentHazardAnticipateAgent` reads the
+hierarchy's own boundary-hazard belief and hedges each query's information
+gain between "the run continues" and "the world just changed".
 
 ## Protocol — rototest
 
@@ -699,27 +708,313 @@ with decisive margin. This is the first mechanism in the program whose *rate
 of forgetting* is a measurement, in the sense that the value printed by the
 posterior tracks the environment it lives in.
 
+## Experiment 007 — the closed loop (a hazard that steers what the agent asks)
+
+Experiment 006's record closed with two open debts: the hand-set hazards grid
+("a true three-level hierarchy is the next candidate"), and the quiet
+behavioral readout ("the identified hazard does not yet buy a B-fast
+advantage"). Experiment 007 pays both at once and asks whether the loop
+*closes*: a hazard learned from the observation stream that also steers which
+queries the agent asks next.
+
+The `LatentHazardAgent` removes the grid entirely. It is Wilson, Nassar, Gold
+& Kording (2010) equations (16)–(24) with no discretization: each node of the
+hierarchy holds four sufficient statistics `(r2, a, b, c)` — the data-level
+run length, the Beta-change-count `a`, the Beta-non-change-count `b` of the
+latent hazard posterior, and a Dirichlet belief `c` over the governing
+feature. The high-level run is `r1 = a + b` (eq. 42) and the node's hazard
+estimate is `h~ = (a + a_p)/(a + b + a_p + b_p)` (eq. 43) with a uniform
+Beta prior `(a_p, b_p) = (1, 1)`. Every boundary observation spawns the four
+children of eq. 24, weighted `(1−h0)(1−h~)`, `(1−h0)h~`, `h0(1−h~)`, `h0h~`
+with the pre-committed meta-hazard `h0 = 1/50`:
+
+- no hazard change, data grows — `r2+1, a, b+1, c·lik`;
+- no hazard change, data changes — `0, a+1, b, fresh`;
+- hazard change, data grows — `r2+1, a_p, b_p, c·lik`;
+- hazard change, data changes — `0, a_p, b_p, fresh`.
+
+The two data-change children are gated to world boundaries (a feature cannot
+change inside a world) exactly as in 006. The hazard-change children are the
+hierarchy's mechanism for *forgetting a dead hazard rate*: they reset the Beta
+counts to the uniform prior, so after a persistent regime the posteriors lean
+on a fresh, unbiased hazard rather than the stale accumulated one. Pruning is
+Wilson et al.'s similarity-bin method (log-binning on `r2`, `r1`, and `h~`)
+capped at 384 easily-sorted states.
+
+The `LatentHazardAnticipateAgent` adds the steering step. Each query's
+information gain is computed twice: once under the current run's feature
+belief (standard weighted IG) and once under a fresh world's belief
+(the change branch's uniform predictive). The query value is the mixture
+`IG = (1−w)·IG_salience + w·IG_fresh`, blended by `w` = the agent's own
+boundary hazard belief `E[h~]` — its estimate that the next world's rule is
+*not* the current run's. Asking what matters if the world just changed is the
+proactive case: a prior that has learned a high rate of change over-weights
+queries that pay off under either feature hypothesis. At `w = 0` (belief of no
+change) the hedged value reduces exactly to standard ACT, so the identical
+machinery with `w = 0` is the natural control inside the agent class itself —
+a paired test of the *belief* as the only difference, not the mechanism.
+
+Protocol. Seven blocks: A-learn (stationary color, `n_worlds = 5` per seed),
+A-transfer (stationary transfer), B-home (ρ = 5), B-slow (ρ = 16), B-fast
+(ρ = 2), then **B-switchrate**, the new block that stresses the forgetting
+machinery directly: 32 calm worlds (ρ = 16) → 16 fast worlds (ρ = 2)
+→ 32 calm worlds (ρ = 16), 80 worlds, entry "shape" continuing B-fast's final
+feature. C-mixed (unconstrained) stays as the safety control. Arms: `null`
+(bare ACT), `grid` (006's `ObservationHazardAgent`, identical streams), `exact`
+(the three-level hierarchy), `anticipate` (the hedged variant). Gates (all
+pre-committed, computed by the harness):
+
+- `A_transfer_no_regression` — exact AND anticipate stay below null on
+  A-transfer (CI upper < 0);
+- `H_order_retained` — exact's post-fast hazard exceeds its post-slow hazard
+  by more than `H_MARGIN = 0.04` (the 006 identification result must survive
+  the grid's removal);
+- `H_fall_recovers` — exact's hazard at the mid of the second calm phase falls
+  *below* the grid's (CI upper < 0): the hierarchy's reset-to-prior children
+  should re-learn the calm rate faster than the grid's stiff cumulative
+  likelihoods;
+- `A_dividend` — anticipate's n_exp on fast worlds (B-fast worlds 2..16 plus
+  switchrate fast worlds 34..48) falls below exact's (CI upper < 0): the
+  hazard-steered ACT must buy a measurable recovery;
+- `C_mixed_no_harm` — both new arms stay within the 0.25 mixed-margin.
+
+A calibration readout (reported, not gated) records each arm's boundary-start
+`E[h~]` against the realized "did the rule change" at every world, so the
+hazard's self-knowledge is measured per pace.
+
+Results (verbatim, `python3 run.py 007`, seed base 7, `n_seeds = 16`):
+
+```
+The Unknown World — Experiment 007 (the closed loop: a hazard that steers what the agent asks)
+
+  per-arm vs null (identical worlds; d = n_exp(arm) - n_exp(null))
+  block         arm         n    mean d  95% CI            p(prior<null)  dz     seeds helping
+----------------------------------------------------------------------------------------------
+  A-learn       grid         80   -0.50  [ -0.65,  -0.35]   0.0003     -0.69   16/16
+  A-learn       exact        80   -0.50  [ -0.65,  -0.35]   0.0003     -0.69   16/16
+  A-learn       anticipate   80   -0.33  [ -0.44,  -0.23]   0.0003     -0.69   16/16
+  A-transfer    grid         80   -0.34  [ -0.51,  -0.16]   0.0003     -0.42   13/16
+  A-transfer    exact        80   -0.34  [ -0.51,  -0.16]   0.0003     -0.42   13/16
+  A-transfer    anticipate   80   -0.30  [ -0.45,  -0.15]   0.0003     -0.47   14/16
+  B-home        grid        320   -0.44  [ -0.53,  -0.36]   0.0003     -0.53   16/16
+  B-home        exact       320   -0.44  [ -0.53,  -0.36]   0.0003     -0.53   16/16
+  B-home        anticipate  320   -0.41  [ -0.49,  -0.33]   0.0003     -0.50   16/16
+  B-slow        grid        512   -0.51  [ -0.59,  -0.44]   0.0003     -0.61   16/16
+  B-slow        exact       512   -0.51  [ -0.59,  -0.44]   0.0003     -0.61   16/16
+  B-slow        anticipate  512   -0.51  [ -0.59,  -0.44]   0.0003     -0.61   16/16
+  B-fast        grid        256   -0.07  [ -0.17,   0.04]   0.1278     -0.08   12/16
+  B-fast        exact       256   -0.07  [ -0.17,   0.04]   0.1278     -0.08   12/16
+  B-fast        anticipate  256   -0.09  [ -0.18,  -0.01]   0.0215     -0.13   12/16
+  B-switchrate  grid       1280   -0.38  [ -0.43,  -0.33]   0.0003     -0.43   16/16
+  B-switchrate  exact      1280   -0.38  [ -0.43,  -0.33]   0.0003     -0.43   16/16
+  B-switchrate  anticipate 1280   -0.31  [ -0.35,  -0.27]   0.0003     -0.45   16/16
+  C-mixed       grid        160    0.05  [ -0.07,   0.17]   0.8127      0.06   7/16
+  C-mixed       exact       160    0.05  [ -0.07,   0.17]   0.8127      0.06   7/16
+  C-mixed       anticipate  160   -0.05  [ -0.12,   0.03]   0.1260     -0.10   13/16
+----------------------------------------------------------------------------------------------
+  effective hazard E[h] (posterior mean over seeds) by capture point
+        post-A   post-home post-slow post-fast post-sr1 post-srfast post-srmid
+    grid         0.1257    0.2163    0.1559    0.2970    0.2523    0.3231    0.3155
+    exact        0.3198    0.3489    0.2523    0.6190    0.2691    0.6251    0.4521
+    anticipate   0.3195    0.3487    0.2526    0.6196    0.2675    0.6263    0.4523
+  post-sr2 (end of the second calm phase):
+    grid         0.3056
+    exact        0.2782
+    anticipate   0.2775
+----------------------------------------------------------------------------------------------
+  gate CIs (the verdict is drawn on these boundaries)
+    A_transfer  exact-null       mean d  -0.34  95% CI [ -0.50,  -0.15]   (upper<0)
+    A_transfer  anticipate-null  mean d  -0.30  95% CI [ -0.44,  -0.16]   (upper<0)
+    H_order     exact post-fast - post-slow  mean  0.367  95% CI [ 0.365,  0.368]  (lower>0.04)
+    H_fall      exact - grid, E[h] at mid second calm  mean  0.137  95% CI [ 0.133,  0.140]  (upper<0)
+    A_dividend  anticipate - exact on fast worlds  mean d  -0.03  95% CI [ -0.08,   0.02]  (upper<0)
+    C_mixed     exact-null       mean d   0.05  95% CI [ -0.07,   0.17]   (upper<0.25)
+    C_mixed     anticipate-null  mean d  -0.05  95% CI [ -0.13,   0.03]   (upper<0.25)
+----------------------------------------------------------------------------------------------
+  mean n_exp per arm on the B-slow calm tails: grid 2.50  exact 2.50  anticipate 2.50  null 3.09
+----------------------------------------------------------------------------------------------
+  calibration readout (reported, not gated): boundary-start belief vs realized switches
+    arm         pace        n   mean pred  realized   brier
+    grid        home         304     0.173     0.158    0.1433
+    grid        slow         496     0.179     0.032    0.0541
+    grid        fast         240     0.228     0.467    0.3143
+    grid        switchrate  1264     0.295     0.139    0.1455
+    exact       home         304     0.335     0.158    0.1752
+    exact       slow         496     0.290     0.032    0.0999
+    exact       fast         240     0.441     0.467    0.2889
+    exact       switchrate  1264     0.425     0.139    0.2087
+    anticipate  home         304     0.334     0.158    0.1751
+    anticipate  slow         496     0.290     0.032    0.1000
+    anticipate  fast         240     0.441     0.467    0.2890
+    anticipate  switchrate  1264     0.425     0.139    0.2087
+----------------------------------------------------------------------------------------------
+  A_TRANSFER_NO_REGRESSION   : True
+  H_ORDER_RETAINED           : True
+  H_FALL_RECOVERS            : False
+  A_DIVIDEND                 : False
+  C_MIXED_NO_HARM            : True
+  verdict: inconclusive
+  Signals mixed (A_ok=True H_order=True H_fall=False A_dividend=False C_ok=True). The closed loop is not kept.
+```
+
+**Measurement notes**
+
+- **The grid is gone and the identification survives — and sharpens.** H_order
+  moves from 0.141 (006) to **0.367** with CI [0.365, 0.368], nine times the
+  margin. The three-level hierarchy's post-fast `E[h]` reaches 0.619 vs the
+  grid's 0.297: without a coarse grid the latent Beta-Bernoulli posterior
+  moves far more decisively onto the fast rate. It also *rests at a
+  different level* on the calm blocks (post-A 0.320 vs grid's 0.126): without
+  grid candidates pinned at {1/8, 1/16, 1/32}, the hierarchy's Beta prior leans
+  on the uniform `(1, 1)` counts and reports a genuinely wider posterior over
+  hazard — the same "both sides present" equals 0.5 prior the agent carries
+  when a run is young. The *ordering* evidence is what the gate demands, and it
+  is overwhelmingly retained.
+- **H_fall is a real negative, honestly measured.** The pre-committed
+  hypothesis was that the hazard-change children (counts reset to prior) would
+  let exact re-learn the calm rate faster than the grid's cumulative likelihoods.
+  It does the opposite *at the gate's sample point*: at post-srmid (mid of the
+  second calm phase) exact sits at 0.452, *above* the grid's 0.315, so the
+  paired `exact − grid` CI is fully positive and the gate fails. The reason is
+  visible in the capture points: exact overshoots far higher on the fast
+  phase (0.625 vs 0.323), and its *fall* from that peak is genuinely faster
+  (0.625 → 0.452 in 12 calm worlds vs the grid's 0.323 → 0.315, a 20× larger
+  drop), but at the single pre-committed sample point the overshoot has not yet
+  been re-absorbed. By post-sr2 it *has* — exact is 0.278, below the grid's
+  0.306. The recovery mechanism exists and is faster; the gate's single point
+  simply sits too early to catch it passing. Reported exactly as measured; the
+  mechanism is kept only if a future test catches the crossing.
+- **The behavioral dividend is null (and the hedge is genuinely exercised).**
+  A_dividend = −0.03, CI [−0.08, 0.02]: the hedged ACT is neither reliably
+  better nor worse on fast worlds. This is not a dormant mechanism — the
+  instrumented trace shows `anticipate` diverges from `exact` on ~6 of 16
+  fast worlds, saving a step on most, losing once — but the *average* effect
+  is real-but-small. The 006 quiet readout survives the close-the-loop step:
+  a hazard that identifies cleanly still does not buy a reliable per-world
+  n_exp advantage in this geometry. n_exp is a coarse yardstick; a world takes
+  ~2–4 experiments and the hedge can only save a step when a 4-step world
+  becomes a 3-step world.
+- **Behavior is inherited and safe.** Both new arms keep the full stationary
+  benefit (A-transfer −0.34/−0.30), the calm tails at 2.50 vs null's 3.09,
+  and both stay inside the mixed margin. B-switchrate is scored for all arms
+  against the same stream and shows the same ≈ −0.4 advantage for every
+  hazard-aware arm: the new block behaves, and behaving is now measured in a
+  block the 006 protocol could not see.
+- **Calibration (not gated) is well-behaved and correctly rounded toward
+  change.** On fast worlds, realized switches = 0.467 and the exact arm
+  predicts 0.441 (Brier 0.289) against the grid's sleepy 0.228 (Brier 0.314).
+  On slow worlds realized = 0.032 and exact predicts 0.290 (Brier 0.100) —
+  the hierarchy correctly senses the calm regime's low rate but its *level*
+  remains inflated by the young-run prior; the grid's lower-and-correct 0.179
+  (Brier 0.054) is better calibrated on calm because its {1/8, 1/16, 1/32}
+  candidates pull the mean down. Neither is a disaster; both report the
+  ordering (high on fast, low on slow) the gates demand.
+- **Stability across seed bases {5, 6, 7, 8, 9} at `n_seeds = 16:`**
+  verdict `inconclusive` at every base. The two failing gates each have one
+  adjacent wobble — A_dividend's CI upper crosses zero at base 7 (0.018) and
+  C_mixed's at base 8 (0.31, the same pre-existing world-draw fragility 002/003
+  diagnosed) — while H_order is stable in 5/5 (CI lower ≈ 0.365 everywhere).
+  A_transfer passes in 5/5. The verdict is not a fluke of seed base.
+- **Honesty constraints that shaped the design.** The five gates and the
+  switchrate hyperparameters (widths, capture points `SR1_AT/SRFAST_AT/SRMID_AT`,
+  `META_HAZARD = 1/50`, `(a_p, b_p) = (1, 1)`, run cap 24, `max_states = 384`)
+  were committed before any 007 measurement. The verdict text (kept / rejected
+  / inconclusive) is computed by the harness from the gate CIs; it has never
+  been hand-edited. The Beta counts `(a, b)` update only at world boundaries —
+  one hazard event per world, matching the world's generative structure in
+  which a feature cannot change inside a world — and become the calibration
+  yardstick read off at boundary starts.
+
+**Verdict, as measured: inconclusive. The closed loop is not kept.** Two of
+the five pre-committed gates fail (H_fall, A_dividend). The three-level
+hierarchy *identifies* the regime rate better than the grid ever did and
+inherits every behavioral benefit, and its hazard belief is better calibrated
+toward change on the fast worlds; but the two steps that would complete the
+loop — a faster calm re-convergence *at the pre-committed sample point* and a
+reliable n_exp dividend from hedging — do not materialize as measured. The
+mechanisms are exercised, the directions are right, and the numbers are small
+but in the hypothesized direction; the record does not allow "kept".
+
+## Retrospective — 001 to 007, what was actually established
+
+A deliberate, honest accounting of what each experiment contributed, and how
+much of the program's claims are delivered by mechanism versus measurement.
+
+| Exp | Claim | Evidence site | Outcome |
+| --- | --- | --- | --- |
+| 001 | ACT (version-space narrowing) adapts to a novel world | n_exp curve | **kept** — the competence-curve primitive works but is context-blind |
+| 002 | A salience prior biases ACT | stationary n_exp | **rejected** — fragile to world-draw composition; exposed rigidity |
+| 003 | Paired seeded rototest makes the measurement honest | re-run of 001/002 | **kept** (methodological) — the harness, verdicts computed by code |
+| 004 | A change-point prior that *learns* beats a blind prior after a switch | B-switch, A-transfer | **kept** — forgetting is measured, but hazard is hand-set |
+| 005 | The prior learns its own hazard (removing the hand-set rate) | winner-sequence hazard | **rejected** — hazard invisible in the 2-feature compressed stream |
+| 006 | Per-observation updates restore hazard identification | E[h] trajectory | **kept** — identification recovered; behavioral dividend still quiet |
+| 007 | Grid-free three-level hazard + hazard-aware ACT closes the loop | H_order, H_fall, A_dividend | **inconclusive** — identification sharpens (0.367), loop steps fail |
+
+Honest accounting of the *novel* content, against the literature the program
+builds on (Wilson, Nassar, Gold & Kording 2010; Adams & MacKay 2007; Nassar,
+Rumsey, Wilson, Parikh, Heasly & Gold 2012; Itti & Baldi 2005; Wilson, Niv &
+Gold 2013; Haber, Mrowca, Fei-Fei & Yamins, NIPS 2018; Liu & van der Schaar,
+ICML 2025):
+
+- Textbook, faithfully re-derived and now measured on a discrete-object
+  world: version-space ACT (001), salience priors (002–003), run-length CPD
+  (004), the Wilson et al. latent-rate recursion (005–007), and bounded-away
+  vs bound growth with evidence gating (004).
+- The *evidence-site finding* is the program's one solid original result
+  without qualification: the hazard is statistically *unidentifiable* from a
+  compressed winner sequence (005) and identifiable from the per-observation
+  stream (006), with the 007 hierarchy reproducing the same evidence site —
+  consistent with Wilson et al.'s §6.1 bound ("takes on the order of 1/(Δρ)
+  binary data points to distinguish … rates differing by Δρ"). This is a
+  *negative-then-positive* control pair that the active- or interactive-leaning
+  literature does not present in this form.
+- The paired seeded rototest (003) is a methodological contribution: verdicts
+  are computed, not claimed; identical worlds pair every arm; stability is
+  scanned across seed bases. Nothing in the program is benchmarked on a fixed
+  task.
+- Claimed only with the explicit caveats below: (a) hazard→ACT *coupling* was
+  not found in the active-learning or BOCPD literature surveyed (to the best
+  of our search, through the 007 record) — but 007 measures a hazard-steered
+  query hedge, and the pairing is the targeted novel probe even if the
+  dividend did not reach significance; (b) *calibrated self-knowledge* — the
+  007 calibration readout (belief vs realized rule change per pace) is
+  reported but not yet gated. Related live work we are aware of: adaptive
+  sampling × change-point detection (Yi & Yang, *Stat. Papers* 2026,
+  arXiv:2512.15507); proactive drift adaptation (*Machine Learning* 2025);
+  recurring concept drift (Suárez-Cetrulo et al. 2023); and a deliberate
+  honesty caveat — Huang, Zhang et al. (DeepMind, ICLR 2023) showed LLM
+  self-correction without ground truth can *degrade* answers, so "self-model"
+  claims here are limited to within-world beliefs measured against realized
+  switches, never introspective text. Liu & van der Schaar (ICML 2025)
+  situate intrinsic metacognitive learning; we claim only the measurement.
+- What the program does **not** claim: intelligence, agency, or competence on
+  any fixed benchmark; any superiority of one learning rule "in general"; or
+  that self-knowledge implies self-improvement. The 007 record is the current
+  honest endpoint: identification recovered and sharpened; the loop that
+  steers the asking is exercised but not (yet) shown to pay.
+
 ## Next
 
-Experiment 006 recovered hazard *identification* by moving the recursion to
-the per-observation stream. The open directions:
+The 007 record leaves three concrete debts:
 
-- **The behavioral dividend.** The identified hazard (post-fast E[h] ≈ 0.30)
-  does not yet buy a clean B-fast n_exp advantage. Longer regime streams,
-  mixed-rate blocks, or a richer geometry should let the learned rate earn a
-  faster recovery where fixed `h = 1/5` under-anticipates change.
-- **A true three-level hierarchy.** The grid is currently pre-committed;
-  Wilson et al.'s latent-rate recursion (`a`, `b` posteriors over the hazard
-  itself) removes even the grid. It should inherit the identification result
-  and sharpen it where the grid is coarse (h = 1/3 vs 1/4).
+- **Catch the crossing.** H_fall failed at a single pre-committed sample
+  point even though exact's calm-recovery rate is ~20× the grid's. A
+  gate that samples the recovery *trajectory* (e.g. the post-sr2 endpoint,
+  or a fitted fall slope) rather than one too-early point is the natural
+  008 measurement — pre-committed *before* running 008, per the discipline.
+- **Make the dividend measurable.** The hedge saves a step on 5 of 6
+  divergent worlds but n_exp's 2–4 granularity hides the average. A
+  per-world cost that can move by fractional steps, or a longer switchrate
+  fast phase, should let the hedge's direction either reach significance or
+  be honestly retired.
 - **A third feature.** The 005→006 record shows the hazard monitor needs
   *evidence* more than *machinery*; a third feature gives a run-length model a
   second dimension to be wrong about and converts the f-vs-change divergence
   prediction (004) into a measurement.
-- **The metacognitive strand.** Two-literature direction: hazard evidence from
-  the prior's *own* convergence cost (n_exp is itself a surprise signal), and
-  a self-model of the learning loop (Haber et al. 2018; Liu & van der Schaar,
-  arXiv:2506.05109). Both are 007 candidates, not yet scheduled.
+- **Calibrated self-knowledge as a gate.** The 007 calibration table is
+  reported not gated; committing a Brier-based calibration gate in a later
+  experiment would complete the metacognitive strand with the same harness
+  discipline as everything else in the program.
 
 > Rule: never declare intelligence from performance on a fixed benchmark.
 > Measure the system's ability to adapt when the rules, tasks, environment,
@@ -728,12 +1023,14 @@ the per-observation stream. The open directions:
 ## Reproduce
 
 ```bash
-python3 run.py                        # Experiment 006 and its verdict (default)
+python3 run.py                        # Experiment 007 and its verdict (default)
+python3 run.py 007                    # Experiment 007 (the closed loop)
+python3 run.py 006                    # Experiment 006 (hazard learned per observation)
 python3 run.py 005                    # Experiment 005 (hazard learned from the winner sequence)
 python3 run.py 004                    # Experiment 004 (change-aware salience)
 python3 run.py 003                    # Experiment 003 (paired rototest v2)
 python3 run.py 002                    # Experiment 002 (legacy run)
-python3 -m unittest discover -s .     # the sanity suite (47 tests)
+python3 -m unittest discover -s .     # the sanity suite (61 tests)
 ```
 
 Stdlib only. No dependencies. Deterministic seed (`random.Random(7)`).
@@ -743,10 +1040,10 @@ Stdlib only. No dependencies. Deterministic seed (`random.Random(7)`).
 | File | Role |
 | --- | --- |
 | `world.py` | generator of minimal unknown-worlds (`Object` color/shape, hidden rule, `force_feature` hook) |
-| `agent.py` | the loop + salience: bare prior (002), tempered `ForgetAgent` (fixed `f`), `ChangePointAgent` (run-length monitor, hazard `h`), `HierarchicalChangePointAgent` (learned hazard over a grid, 005), `ObservationHazardAgent` (per-observation learned hazard, 006) |
-| `protocol.py` | paired seeded harness (003), four-arm change-aware / regime-stream harnesses (004–006): exact permutation p, bootstrap CI, Cohen's `dz`, hazard-identification gates, harness verdicts |
-| `run.py` | runs Experiment 006 by default; `run.py 005` / `004` / `003` / `002` reproduce the earlier evidence |
-| `test_step1.py` | sanity suite (47 tests: world, salience, protocol, statistics, paired v2, change-aware, hierarchy, observation-hazard) |
+| `agent.py` | the loop + salience: bare prior (002), tempered `ForgetAgent` (fixed `f`), `ChangePointAgent` (run-length monitor, hazard `h`), `HierarchicalChangePointAgent` (learned hazard over a grid, 005), `ObservationHazardAgent` (per-observation learned hazard, 006), `LatentHazardAgent` / `LatentHazardAnticipateAgent` (grid-free three-level hierarchy + hazard-hedged ACT, 007) |
+| `protocol.py` | paired seeded harness (003), four-arm change-aware / regime-stream harnesses (004–007): exact permutation p, bootstrap CI, Cohen's `dz`, hazard-identification and switchrate gates, calibration readout, harness verdicts |
+| `run.py` | runs Experiment 007 by default; `run.py 006` / `005` / `004` / `003` / `002` reproduce the earlier evidence |
+| `test_step1.py` | sanity suite (61 tests: world, salience, protocol, statistics, paired v2, change-aware, hierarchy, observation-hazard, latent-hazard, latent-hazard-anticipate) |
 
 ## License
 

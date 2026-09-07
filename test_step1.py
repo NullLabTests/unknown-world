@@ -7,6 +7,8 @@ from agent import (
     ForgetAgent,
     HAZARD_GRID,
     HierarchicalChangePointAgent,
+    LatentHazardAgent,
+    LatentHazardAnticipateAgent,
     ObservationHazardAgent,
     predicts_open,
 )
@@ -21,6 +23,7 @@ from protocol import (
     rototest_004,
     rototest_005,
     rototest_006,
+    rototest_007,
     run_null_sequence,
     run_prior_sequence,
     run_rototest,
@@ -431,6 +434,162 @@ class ObservationHazardTests(unittest.TestCase):
         self.assertEqual(r1["verdict"], r2["verdict"])
         self.assertEqual(r1["gates"], r2["gates"])
         self.assertEqual(r1["h_order_ci"], r2["h_order_ci"])
+
+
+class LatentHazardTests(unittest.TestCase):
+    def _stream(self, feature, n, seed=7):
+        rng = random.Random(seed)
+        return [UnknownWorld.generate(rng, force_feature=feature) for _ in range(n)]
+
+    def test_reset_uniform_state(self):
+        h = LatentHazardAgent()
+        for w in self._stream("color", 3):
+            h.run_world(w)
+        h.reset_salience()
+        self.assertEqual(len(h.nodes), 1)
+        self.assertEqual(h.nodes[0][:4], (0, 1.0, 1.0, {"color": 1.0, "shape": 1.0}))
+        self.assertEqual(h.nodes[0][4], 1.0)
+        self.assertAlmostEqual(h.effective_hazard(), 0.5)
+        self.assertTrue(h._boundary_pending)
+
+    def test_fresh_world_equals_bare(self):
+        for seed in (1, 5, 9):
+            rng = random.Random(seed)
+            w = UnknownWorld.generate(rng)
+            a, h = Agent(), LatentHazardAgent()
+            self.assertEqual(a.run_world(w)["steps"], h.run_world(w)["steps"])
+            self.assertEqual(a.run_world(w)["held_out"], h.run_world(w)["held_out"])
+
+    def test_stationary_stream_learns_slow(self):
+        h = LatentHazardAgent()
+        for w in self._stream("color", 20):
+            h.run_world(w)
+        self.assertLess(h.effective_hazard(), 0.35)
+
+    def test_fast_stream_orders_hazard_above_slow(self):
+        h = LatentHazardAgent()
+        for w in self._stream("color", 5):
+            h.run_world(w)
+        rng = random.Random(3)
+        for w in _regime_worlds(rng, (16, 16), "shape"):
+            h.run_world(w)
+        slow_h = h.effective_hazard()
+        seed = 4
+        for i in range(8):
+            feat = "color" if i % 2 == 0 else "shape"
+            for w in self._stream(feat, 2, seed=seed):
+                h.run_world(w)
+            seed += 1
+        fast_h = h.effective_hazard()
+        self.assertGreater(fast_h, slow_h + 0.01)
+
+    def test_hazard_rises_then_falls_on_switchrate(self):
+        h = LatentHazardAgent()
+        rng = random.Random(4)
+        worlds = _regime_worlds(rng, (16, 16, 2, 2, 2, 2, 2, 2, 2, 2, 16, 16), "shape")
+        points = []
+        for n in (32, 48, 60, 80):
+            a = LatentHazardAgent()
+            rng2 = random.Random(4)
+            for w in _regime_worlds(rng2, (16, 16, 2, 2, 2, 2, 2, 2, 2, 2, 16, 16), "shape")[:n]:
+                a.run_world(w)
+            points.append(a.effective_hazard())
+        self.assertGreater(points[1], points[0] + 0.1)
+        self.assertLess(points[3], points[1])
+
+    def test_node_count_bounded(self):
+        h = LatentHazardAgent()
+        rng = random.Random(5)
+        for w in _regime_worlds(rng, (16, 16, 2, 2, 2, 2, 2, 2, 2, 2, 16, 16), "shape"):
+            h.run_world(w)
+            self.assertLessEqual(len(h.nodes), h.max_states)
+
+    def test_solves_shape_after_color(self):
+        h = LatentHazardAgent()
+        for w in self._stream("color", 5):
+            h.run_world(w)
+        r = h.run_world(self._stream("shape", 1, seed=7)[0])
+        self.assertEqual(r["held_out"], 100.0)
+        self.assertEqual(r["rule"][0], "shape")
+
+    def test_deterministic(self):
+        a, b = LatentHazardAgent(), LatentHazardAgent()
+        for w in self._stream("color", 4):
+            a.run_world(w)
+        for w in self._stream("color", 4):
+            b.run_world(w)
+        self.assertEqual(a.nodes, b.nodes)
+        self.assertEqual(a.value_weights, b.value_weights)
+
+    def test_rototest_007_deterministic(self):
+        r1 = rototest_007(seed=9, n_worlds=3, n_seeds=4)
+        r2 = rototest_007(seed=9, n_worlds=3, n_seeds=4)
+        self.assertEqual(r1["verdict"], r2["verdict"])
+        self.assertEqual(r1["gates"], r2["gates"])
+        self.assertEqual(r1["h_order_ci"], r2["h_order_ci"])
+
+
+class LatentHazardAnticipateTests(unittest.TestCase):
+    class ZeroHedge(LatentHazardAnticipateAgent):
+        def begin_world(self, world):
+            super().begin_world(world)
+            self._hedge_w = 0.0
+
+    def _fast_stream(self, seed=3):
+        rng = random.Random(seed)
+        return _regime_worlds(rng, (2, 2, 2, 2, 2, 2, 2, 2), "color")
+
+    def test_hedge_w_zero_identical_to_exact(self):
+        for seed in (3, 8):
+            ex, ac = LatentHazardAgent(), self.ZeroHedge()
+            rng = random.Random(seed)
+            streams = _regime_worlds(rng, (2, 2, 2, 2, 2, 2, 2, 2), "color")
+            same = True
+            for w in streams:
+                re = ex.run_world(w)
+                ra = ac.run_world(w)
+                if (re["steps"], re["curve"]) != (ra["steps"], ra["curve"]):
+                    same = False
+                    break
+            self.assertTrue(same)
+
+    def test_hedge_changes_query_choice_on_fast_worlds(self):
+        ex, ac = LatentHazardAgent(), LatentHazardAnticipateAgent()
+        rng = random.Random(3)
+        streams = _regime_worlds(rng, (2, 2, 2, 2, 2, 2, 2, 2), "color")
+        differed = False
+        for w in streams:
+            re = ex.run_world(w)
+            ra = ac.run_world(w)
+            if (re["steps"], re["curve"]) != (ra["steps"], ra["curve"]):
+                differed = True
+                break
+        self.assertTrue(differed)
+
+    def test_hedge_belief_is_the_effective_hazard(self):
+        ac = LatentHazardAnticipateAgent()
+        rng = random.Random(11)
+        for _ in range(4):
+            ac.run_world(UnknownWorld.generate(rng, force_feature="color"))
+        self.assertTrue(0.0 < ac._hedge_w < 1.0)
+        self.assertEqual(ac._hedge_w, ac._world_p_change)
+
+    def test_hedge_solves_shape_after_color(self):
+        ac = LatentHazardAnticipateAgent()
+        rng = random.Random(11)
+        for _ in range(5):
+            ac.run_world(UnknownWorld.generate(rng, force_feature="color"))
+        r = ac.run_world(UnknownWorld.generate(rng, force_feature="shape"))
+        self.assertEqual(r["held_out"], 100.0)
+        self.assertEqual(r["rule"][0], "shape")
+
+    def test_deterministic(self):
+        a, b = LatentHazardAnticipateAgent(), LatentHazardAnticipateAgent()
+        for w in self._fast_stream():
+            a.run_world(w)
+        for w in self._fast_stream():
+            b.run_world(w)
+        self.assertEqual(a.nodes, b.nodes)
 
 
 if __name__ == "__main__":

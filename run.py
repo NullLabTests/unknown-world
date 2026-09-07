@@ -1,4 +1,4 @@
-"""Experiment driver: 006 (the hazard learned per observation) by default; `run.py 002/003/004/005` reproduce legacy runs."""
+"""Experiment driver: 007 (the closed loop) by default; `run.py 002/003/004/005/006` reproduce legacy runs."""
 import sys
 
 from protocol import (
@@ -6,17 +6,19 @@ from protocol import (
     print_004_report,
     print_005_report,
     print_006_report,
+    print_007_report,
     print_paired_report,
     print_report,
     rototest_004,
     rototest_005,
     rototest_006,
+    rototest_007,
     run_rototest,
 )
 
 
 def main():
-    exp = sys.argv[1] if len(sys.argv) > 1 else "006"
+    exp = sys.argv[1] if len(sys.argv) > 1 else "007"
     if exp == "002":
         print("The Unknown World — Experiment 002 (feature-salience prior)\n")
         print_report(run_rototest(seed=7))
@@ -44,12 +46,20 @@ def main():
         )
         print_005_report(result)
         return
-    result = rototest_006(seed=7, n_worlds=5, n_seeds=16)
+    if exp == "006":
+        result = rototest_006(seed=7, n_worlds=5, n_seeds=16)
+        print(
+            "The Unknown World — Experiment 006 "
+            "(the hazard learned per observation)\n"
+        )
+        print_006_report(result)
+        return
+    result = rototest_007(seed=7, n_worlds=5, n_seeds=16)
     print(
-        "The Unknown World — Experiment 006 "
-        "(the hazard learned per observation)\n"
+        "The Unknown World — Experiment 007 "
+        "(the closed loop: a hazard that steers what the agent asks)\n"
     )
-    print_006_report(result)
+    print_007_report(result)
 
 
 if __name__ == "__main__":
